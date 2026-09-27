@@ -778,7 +778,7 @@ const SyncedLine = memo(function SyncedLine({
  *
  * "No lyrics available" is the least useful sentence a music app can show — it gives the
  * listener nothing to act on and gives a bug report nothing to go on. This turns it into a
- * fact: which of the five ranked sources was asked, how long it took, and why it lost.
+ * fact: which of the ranked sources was asked, how long it took, and why it lost.
  */
 function LyricsSourcePanel({
   attempts,

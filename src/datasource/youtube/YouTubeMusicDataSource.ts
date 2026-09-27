@@ -203,6 +203,10 @@ type BetterLyricsResponse = {
    was really decided by the order of an array literal. It is now the LYRICS_SOURCES table. */
 type LyricsProviderResult = Lyrics;
 
+type SimpMusicResponse = {
+  data?: Array<{ syncedLyrics?: string | null; vote?: number }>;
+};
+
 type RawLikeEndpoint = {
   status?: string;
   target?: string | {
@@ -4658,6 +4662,7 @@ export class YouTubeMusicDataSource extends DataSource {
       "lrclib-exact": () => this.fetchLrcLibExactLyrics(track),
       betterlyrics: () => this.fetchBetterLyrics(track),
       "lrclib-search": () => this.fetchLrcLibSearchLyrics(track),
+      simpmusic: () => this.fetchSimpMusicLyrics(track),
       "youtube-transcript": () => this.fetchYouTubeTranscriptLyrics(track),
       "youtube-music": () => this.fetchYouTubeMusicLyrics(track),
     };
@@ -4927,6 +4932,28 @@ export class YouTubeMusicDataSource extends DataSource {
     }
 
     return null;
+  }
+
+  // Keyed by video ID, so never another recording; ranked below LRCLIB because entries can be translations (#129).
+  private async fetchSimpMusicLyrics(track: Track): Promise<LyricsProviderResult | null> {
+    const response = await tauriFetch(
+      `https://api-lyrics.simpmusic.org/v1/${encodeURIComponent(track.id)}`,
+      { headers: this.getLyricsRequestHeaders(), timeoutMs: 3_500 },
+    );
+    if (!response.ok) return null;
+
+    const body = await response.json() as SimpMusicResponse;
+    const best = (body.data ?? [])
+      .filter((entry) => entry.syncedLyrics)
+      .sort((left, right) => (right.vote ?? 0) - (left.vote ?? 0))[0];
+    const lines = best?.syncedLyrics ? this.parseSyncedLyrics(best.syncedLyrics) : [];
+    if (lines.length === 0) return null;
+
+    logInternalInfo("YouTubeMusicDataSource.getLyrics SimpMusic success", {
+      trackId: track.id,
+      lineCount: lines.length,
+    });
+    return { lines, timing: "synced", sourceLabel: "SimpMusic" };
   }
 
   private toLrcLibLyrics(

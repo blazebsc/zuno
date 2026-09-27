@@ -39,7 +39,7 @@ const synced = (count: number) => ({
   timing: "synced" as const,
 });
 
-equal(LYRICS_SOURCES.length, 5, "every source is in the table");
+equal(LYRICS_SOURCES.length, 6, "every source is in the table");
 check(
   rankOfSource("lrclib-exact") < rankOfSource("lrclib-search"),
   "a duration-exact match outranks a text search of the same corpus",
@@ -139,7 +139,7 @@ equal(
 
 const defaultWaves = planLyricsWaves();
 equal(defaultWaves.length, 2, "by default the expensive sources are held back to a second wave");
-equal(defaultWaves[0].length, 3, "three cheap sources race first");
+equal(defaultWaves[0].length, 4, "four cheap sources race first");
 check(
   defaultWaves[1].every((source) => source.wave === 2),
   "and only wave two sources are held back",
@@ -161,7 +161,7 @@ equal(
 );
 equal(
   planLyricsWaves("lrclib-exact")[0].length,
-  3,
+  4,
   "preferring a source already in wave one does not duplicate it",
 );
 

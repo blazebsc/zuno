@@ -15,7 +15,7 @@ export interface LyricsSource {
    *
    * Declared here rather than left as an early `return null` inside the fetcher, because a
    * fetcher that quietly returns nothing is indistinguishable from one that searched and
-   * found nothing — which is how two of five sources went missing on every track without a
+   * found nothing — which is how two of the sources went missing on every track without a
    * duration while the UI cheerfully reported "No match".
    */
   requiresDuration?: boolean;
@@ -54,6 +54,13 @@ export const LYRICS_SOURCES: LyricsSource[] = [
     wave: 1,
     requiresDuration: true,
     note: "Same corpus, matched by text within two seconds of duration — can land on a different master.",
+  },
+  {
+    id: "simpmusic",
+    label: "SimpMusic",
+    timeoutMs: 3_500,
+    wave: 1,
+    note: "Line-synced and keyed to this exact video, but community entries are sometimes translations.",
   },
   {
     id: "youtube-transcript",
