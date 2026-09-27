@@ -536,7 +536,12 @@ export class YouTubeMusicDataSource extends DataSource {
   private getMusicClient(): Promise<Innertube> {
     if (!this.musicClientPromise) {
       logInternalInfo("YouTubeMusicDataSource.getMusicClient creating client");
-      this.musicClientPromise = this.createMusicClient(true);
+      const promise = this.createMusicClient(true);
+      // A failure (offline at launch) must not be cached, or every call fails until restart.
+      promise.catch(() => {
+        if (this.musicClientPromise === promise) this.musicClientPromise = null;
+      });
+      this.musicClientPromise = promise;
     }
 
     return this.musicClientPromise;
@@ -547,10 +552,14 @@ export class YouTubeMusicDataSource extends DataSource {
       logInternalInfo("YouTubeMusicDataSource.getWebClient creating client");
       // No player needed: this client only enumerates accounts and resolves like endpoints,
       // neither of which touches stream URLs, and retrieving it downloads the player script.
-      this.webClientPromise = Innertube.create({
+      const promise = Innertube.create({
         ...this.getSessionOptions(false),
         client_type: ClientType.WEB,
       });
+      promise.catch(() => {
+        if (this.webClientPromise === promise) this.webClientPromise = null;
+      });
+      this.webClientPromise = promise;
     }
 
     return this.webClientPromise;
@@ -579,7 +588,7 @@ export class YouTubeMusicDataSource extends DataSource {
   private getDownloadClient(): Promise<Innertube> {
     if (!this.downloadClientPromise) {
       logInternalInfo("YouTubeMusicDataSource.getDownloadClient creating client");
-      this.downloadClientPromise = (async () => {
+      const promise = (async () => {
         const bootstrap = await Innertube.create({
           fetch: tauriFetch,
           retrieve_player: false,
@@ -596,6 +605,15 @@ export class YouTubeMusicDataSource extends DataSource {
           client_type: ClientType.MUSIC,
         });
       })();
+      /*
+       * Never cache a failure. Built offline at launch, it used to stay rejected for the whole
+       * session, so every stream fell back to the music client, whose URLs googlevideo refuses
+       * after the first chunk — songs cut out after a few seconds and were skipped.
+       */
+      promise.catch(() => {
+        if (this.downloadClientPromise === promise) this.downloadClientPromise = null;
+      });
+      this.downloadClientPromise = promise;
     }
 
     return this.downloadClientPromise;
@@ -2979,7 +2997,16 @@ export class YouTubeMusicDataSource extends DataSource {
        * fields are already the values it assigns.
        */
       this.resetMusicClients();
-      await this.getMusicClient();
+      /*
+       * Offline, the client cannot be built, but the stored credential is still the session:
+       * failing here used to fall through to "signed out" and hide the cached library and
+       * downloads. The client is built on first use once the network is back.
+       */
+      await this.getMusicClient().catch((error) => {
+        logInternalWarn("YouTubeMusicDataSource.restoreSession client deferred", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
       logInternalInfo("YouTubeMusicDataSource.restoreSession success");
       return true;
     } catch (error) {
@@ -5726,7 +5753,10 @@ export class YouTubeMusicDataSource extends DataSource {
         logInternalWarn("YouTubeMusicDataSource.getStreamData client failed", {
           trackId: track.id,
           client: label,
-          error: error instanceof Error ? error.message : String(error),
+          // tauriFetch rejects with a plain `{ message }`, which String() turns into "[object Object]".
+          error: error instanceof Error
+            ? error.message
+            : (error as { message?: string } | null)?.message ?? String(error),
         });
       }
     }

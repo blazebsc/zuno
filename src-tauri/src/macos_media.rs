@@ -130,7 +130,7 @@ impl MacosMediaSession {
 fn spawn_artwork_fetch(app: &AppHandle, url: String) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let bytes = load_artwork_bytes(&url).await.unwrap_or_default();
+        let bytes = load_artwork_bytes(&app, &url).await.unwrap_or_default();
         let Some(session) = app.try_state::<MacosMediaSession>() else {
             return;
         };
@@ -140,8 +140,13 @@ fn spawn_artwork_fetch(app: &AppHandle, url: String) {
     });
 }
 
-async fn load_artwork_bytes(url: &str) -> Option<Vec<u8>> {
+async fn load_artwork_bytes(app: &AppHandle, url: &str) -> Option<Vec<u8>> {
     use base64::Engine;
+
+    // A downloaded song's saved cover, so Now Playing keeps its artwork offline.
+    if let Some(path) = crate::offline_artwork_file(app, url) {
+        return std::fs::read(path).ok();
+    }
 
     // Embedded cover of a local file. The tag read blocks, but once per track, not per update.
     if let Some(path) = url.strip_prefix("local-art:") {
@@ -151,7 +156,7 @@ async fn load_artwork_bytes(url: &str) -> Option<Vec<u8>> {
             .ok();
     }
 
-    let response = reqwest::get(url).await.ok()?;
+    let response = crate::http_client_builder().build().ok()?.get(url).send().await.ok()?;
     if !response.status().is_success() {
         return None;
     }

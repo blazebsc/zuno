@@ -29,6 +29,7 @@ import { TrackRow } from "../components/TrackRow";
 import { useNowPlaying } from "../hooks/useNowPlaying";
 import { usePlaylistContextMenu } from "../components/PlaylistContextMenu";
 import { useTrackContextMenu } from "../components/TrackContextMenu";
+import { loadFailedMessage } from "../../internal/connectivity";
 
 type ReleaseFilter = "all" | "album" | "single" | "ep";
 
@@ -144,7 +145,7 @@ export function ArtistView({
       })
       .catch(() => {
         // A remembered page is still good to show; only a cold load has nothing to fall back to.
-        if (active && !remembered) setError("Unable to load this artist.");
+        if (active && !remembered) setError(loadFailedMessage("Unable to load this artist."));
       })
       .finally(() => {
         if (active) setIsLoading(false);

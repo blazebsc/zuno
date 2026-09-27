@@ -1,10 +1,12 @@
-import { useSyncExternalStore } from "react";
+import { useMemo, useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { Track } from "../datasource/types";
 import { logInternalError, logInternalInfo, logInternalWarn } from "../internal/logging";
 import { getAppSetting, setAppSetting } from "../internal/appSettings";
 import { getDownloadQuality, type AudioQuality } from "../internal/audioQuality";
+import { artworkIdentity, getArtworkUrlCandidates } from "../datasource/youtube/artwork";
+import { isOnline, onReconnect, useOnline } from "../internal/connectivity";
 
 const MANIFEST_KEY = "zuno.offline-manifest.v1";
 const MAX_BYTES_KEY = "zuno.offline-max-bytes.v1";
@@ -26,7 +28,14 @@ export interface OfflineEntry {
   track: Track;
   byteLength: number;
   downloadedAt: number;
+  /** A cover saved beside the audio, so the song still shows its artwork offline. */
+  hasArtwork?: boolean;
 }
+
+type OnDiskEntry = { trackId: string; byteLength: number; hasArtwork?: boolean };
+
+/** `artworkUrl` value that TrackArtwork reads from disk through `offline_artwork`. */
+export const OFFLINE_ARTWORK_PREFIX = "offline-artwork:";
 
 export interface OfflineState {
   entries: Record<string, OfflineEntry>;
@@ -108,7 +117,15 @@ function setState(next: Partial<OfflineState>): void {
   emit();
 }
 
+/** Artwork identity → downloaded track holding that cover on disk. */
+let artworkIndex = new Map<string, string>();
+
 function commitEntries(entries: Record<string, OfflineEntry>): void {
+  artworkIndex = new Map(
+    Object.values(entries)
+      .filter((entry) => entry.hasArtwork && entry.track.artworkUrl)
+      .map((entry) => [artworkIdentity(entry.track.artworkUrl!), entry.track.id]),
+  );
   writeManifest(entries);
   setState({
     entries,
@@ -137,15 +154,15 @@ export function setOfflineMaxBytes(maxBytes: number): void {
  */
 export function reconcileManifest(
   manifest: Record<string, OfflineEntry>,
-  onDisk: ReadonlyArray<{ trackId: string; byteLength: number }>,
+  onDisk: ReadonlyArray<OnDiskEntry>,
 ): { entries: Record<string, OfflineEntry>; orphans: string[] } {
-  const byId = new Map(onDisk.map((entry) => [entry.trackId, entry.byteLength]));
+  const byId = new Map(onDisk.map((entry) => [entry.trackId, entry]));
   const entries: Record<string, OfflineEntry> = {};
 
   for (const [trackId, entry] of Object.entries(manifest)) {
-    const byteLength = byId.get(trackId);
-    if (byteLength === undefined) continue;
-    entries[trackId] = { ...entry, byteLength };
+    const file = byId.get(trackId);
+    if (!file) continue;
+    entries[trackId] = { ...entry, byteLength: file.byteLength, hasArtwork: Boolean(file.hasArtwork) };
   }
 
   const orphans = Object.keys(manifest).length === 0
@@ -168,9 +185,7 @@ export async function hydrateOfflineStore(): Promise<void> {
   // the durable file is what is left when local storage is cleared out from underneath us.
   const manifest = { ...(await readDurableManifest()), ...readManifest() };
   try {
-    const onDisk = await invoke<Array<{ trackId: string; byteLength: number }>>(
-      "offline_audio_list",
-    );
+    const onDisk = await invoke<OnDiskEntry[]>("offline_audio_list");
     const { entries, orphans } = reconcileManifest(manifest, onDisk);
     for (const trackId of orphans) {
       void invoke("offline_audio_remove", { trackId }).catch(() => {});
@@ -178,6 +193,7 @@ export async function hydrateOfflineStore(): Promise<void> {
 
     commitEntries(entries);
     logInternalInfo("offlineStore.hydrate", { count: Object.keys(entries).length });
+    void backfillArtwork();
   } catch (error) {
     logInternalWarn("offlineStore.hydrate failed", {
       error: error instanceof Error ? error.message : String(error),
@@ -220,6 +236,103 @@ export function isTrackDownloaded(trackId: string): boolean {
  */
 export function getOfflineTrack(trackId: string): Track | undefined {
   return state.entries[trackId]?.track;
+}
+
+/** Offline-playable: a local file, or a download whose audio is on disk. */
+export function isPlayableOffline(track: Track): boolean {
+  return track.source === "local" || Boolean(state.entries[track.id]);
+}
+
+/** Every word of `query` appears in the title, artist or album, ignoring case. */
+export function matchesDownloadQuery(track: Track, query: string): boolean {
+  const haystack = `${track.title} ${track.artist} ${track.album ?? ""}`.toLocaleLowerCase();
+  const words = query.toLocaleLowerCase().split(/\s+/).filter(Boolean);
+  return words.length > 0 && words.every((word) => haystack.includes(word));
+}
+
+/** Offline search: downloads are the only songs that can be found and played. */
+export function searchDownloads(query: string): Track[] {
+  return Object.values(state.entries)
+    .map((entry) => entry.track)
+    .filter((track) => matchesDownloadQuery(track, query));
+}
+
+/** True while offline for a song that needs the network to play. */
+export function useUnavailableOffline(track: Track): boolean {
+  const online = useOnline();
+  const playable = useSyncExternalStore(subscribe, () => isPlayableOffline(track), () => true);
+  return !online && !playable;
+}
+
+/**
+ * The saved cover for any artwork URL that belongs to a download, or undefined.
+ *
+ * Matched on the image rather than the track, so it applies wherever that cover shows —
+ * queue, playlists, the player bar — not only in the Downloads list.
+ */
+export function useOfflineArtworkUrl(artworkUrl: string | undefined): string | undefined {
+  const identity = useMemo(() => (artworkUrl ? artworkIdentity(artworkUrl) : null), [artworkUrl]);
+  const trackId = useSyncExternalStore(
+    subscribe,
+    () => (identity ? artworkIndex.get(identity) : undefined),
+    () => undefined,
+  );
+  return trackId ? `${OFFLINE_ARTWORK_PREFIX}${trackId}` : undefined;
+}
+
+async function saveArtwork(track: Track): Promise<boolean> {
+  const url = getArtworkUrlCandidates(track.artworkUrl, 544)[0];
+  if (!url) return false;
+  try {
+    await invoke("offline_artwork_save", { trackId: track.id, url });
+    return true;
+  } catch (error) {
+    logInternalWarn("offlineStore.saveArtwork failed", {
+      trackId: track.id,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
+}
+
+let backfilling = false;
+
+/**
+ * Saves covers for downloads made before covers were saved, one at a time.
+ *
+ * Runs at launch and on every reconnect; three misses in a row (probably offline) end a pass.
+ */
+async function backfillArtwork(): Promise<void> {
+  if (backfilling || !isOnline()) return;
+  backfilling = true;
+  try {
+    await backfillMissingArtwork();
+  } finally {
+    backfilling = false;
+  }
+}
+
+async function backfillMissingArtwork(): Promise<void> {
+  const missing = Object.values(state.entries).filter(
+    (entry) => !entry.hasArtwork && entry.track.artworkUrl,
+  );
+  const saved = new Set<string>();
+  let misses = 0;
+  for (const entry of missing) {
+    if (await saveArtwork(entry.track)) {
+      saved.add(entry.track.id);
+      misses = 0;
+    } else if (++misses >= 3) {
+      break;
+    }
+  }
+  if (saved.size === 0) return;
+  commitEntries(Object.fromEntries(
+    Object.entries(state.entries).map(([trackId, entry]) => [
+      trackId,
+      saved.has(trackId) ? { ...entry, hasArtwork: true } : entry,
+    ]),
+  ));
 }
 
 /** Resolves the stream URL for a track. Callers pass this in so the store stays data-source agnostic. */
@@ -302,6 +415,8 @@ async function pump(): Promise<void> {
 
   if (pumping || state.downloadingId !== null) return;
   if (state.queued.length === 0) return;
+  // Offline, every download would fail and drop out of the queue; it waits for onReconnect instead.
+  if (!isOnline()) return;
   if (!resolveStreamUrl) {
     logInternalWarn("offlineStore.pump has no stream resolver");
     return;
@@ -309,7 +424,7 @@ async function pump(): Promise<void> {
 
   pumping = true;
   try {
-    while (state.queued.length > 0) {
+    while (state.queued.length > 0 && isOnline()) {
       const [trackId, ...rest] = state.queued;
       const track = pendingTracks.get(trackId);
       setState({ queued: rest, downloadingId: trackId, progress: null });
@@ -324,6 +439,7 @@ async function pump(): Promise<void> {
         const { url, mimeType, cookie } = await resolveStreamUrl(track, getDownloadQuality());
         const byteLength = await invoke<number>("offline_audio_save", { url, trackId, cookie });
         logInternalInfo("offlineStore.download complete", { trackId, byteLength });
+        const hasArtwork = await saveArtwork(track);
         pendingTracks.delete(trackId);
         {
           const { [trackId]: _done, ...pending } = state.pending;
@@ -331,11 +447,21 @@ async function pump(): Promise<void> {
         }
         commitEntries({
           ...state.entries,
-          [trackId]: { track: { ...track, mimeType }, byteLength, downloadedAt: Date.now() },
+          [trackId]: {
+            track: { ...track, mimeType },
+            byteLength,
+            downloadedAt: Date.now(),
+            hasArtwork,
+          },
         });
         setState({ downloadingId: null, progress: null });
         await prune();
       } catch (error) {
+        // Lost the connection mid-download: back to the front of the queue, not a failure.
+        if (!isOnline()) {
+          setState({ queued: [trackId, ...state.queued], downloadingId: null, progress: null });
+          break;
+        }
         pendingTracks.delete(trackId);
         const { [trackId]: _failed, ...pending } = state.pending;
         const message = error instanceof Error ? error.message : String(error);
@@ -362,9 +488,7 @@ async function prune(): Promise<void> {
 
   try {
     await invoke("offline_audio_prune", { maxBytes });
-    const onDisk = await invoke<Array<{ trackId: string; byteLength: number }>>(
-      "offline_audio_list",
-    );
+    const onDisk = await invoke<OnDiskEntry[]>("offline_audio_list");
     const kept = new Set(onDisk.map((entry) => entry.trackId));
     const entries = Object.fromEntries(
       Object.entries(state.entries).filter(([trackId]) => kept.has(trackId)),
@@ -377,6 +501,11 @@ async function prune(): Promise<void> {
   }
 }
 
+onReconnect(() => {
+  void pump();
+  void backfillArtwork();
+});
+
 function subscribe(listener: Listener): () => void {
   listeners.add(listener);
   return () => listeners.delete(listener);
@@ -384,6 +513,11 @@ function subscribe(listener: Listener): () => void {
 
 export function getOfflineState(): OfflineState {
   return state;
+}
+
+/** Downloaded entries only, so a list of them does not re-render on every progress tick. */
+export function useOfflineEntries(): Record<string, OfflineEntry> {
+  return useSyncExternalStore(subscribe, () => state.entries, () => state.entries);
 }
 
 export function useOfflineState(): OfflineState {

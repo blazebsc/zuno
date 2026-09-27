@@ -5,6 +5,7 @@ import type { PlayerState } from "./PlayerController";
 import type { PlayerControllerActions } from "./playerStore";
 import { logInternalWarn } from "../internal/logging";
 import { useLinuxMediaSession } from "../ui/settings/mediaSession";
+import { useOfflineArtworkUrl } from "./offlineStore";
 
 type NativeMediaAction =
   | "play"
@@ -94,6 +95,8 @@ export function useMediaSession(
     () => getNativeMediaControlEvent(linuxMediaSession),
     [linuxMediaSession],
   );
+  // A downloaded song's saved cover, so the OS media controls keep their artwork offline.
+  const offlineArtworkUrl = useOfflineArtworkUrl(state.currentTrack?.artworkUrl);
   const sendNativeMediaUpdate = useCallback((context: string, forceMetadata = false) => {
     if (!nativeMediaCommand) return;
 
@@ -103,7 +106,7 @@ export function useMediaSession(
       update: {
         title: track?.title ?? null,
         artist: track?.artist ?? null,
-        artworkUrl: track?.artworkUrl ?? null,
+        artworkUrl: offlineArtworkUrl ?? track?.artworkUrl ?? null,
         status: state.status,
         durationSec: duration || null,
         positionSec: getClampedPosition(duration, controller.getCurrentTime()),
@@ -114,7 +117,7 @@ export function useMediaSession(
         error: String(error),
       });
     });
-  }, [controller, nativeMediaCommand, state.currentTrack, state.status]);
+  }, [controller, nativeMediaCommand, offlineArtworkUrl, state.currentTrack, state.status]);
 
   useEffect(() => {
     if (!nativeMediaControlEvent) return;

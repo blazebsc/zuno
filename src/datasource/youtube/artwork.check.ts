@@ -10,7 +10,12 @@
  */
 export {};
 
-import { getArtworkSizeBucket, getArtworkUrlCandidates, selectArtworkUrl } from "./artwork";
+import {
+  artworkIdentity,
+  getArtworkSizeBucket,
+  getArtworkUrlCandidates,
+  selectArtworkUrl,
+} from "./artwork";
 
 function check(condition: boolean, message: string): void {
   if (!condition) throw new Error(`FAILED: ${message}`);
@@ -93,6 +98,23 @@ check(
 check(
   getArtworkSizeBucket(280) === null,
   "a 2x slot needing more than 544 still keeps the original",
+);
+
+// A saved download cover has to match the same song at every size it is shown at.
+check(
+  artworkIdentity("https://lh3.googleusercontent.com/abc=w120-h120-l90-rj")
+    === artworkIdentity("//lh3.googleusercontent.com/abc=w544-h544-l90-rj"),
+  "size variants of one cover share an identity",
+);
+check(
+  artworkIdentity("https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg")
+    === artworkIdentity("https://i9.ytimg.com/vi_webp/dQw4w9WgXcQ/mqdefault.webp"),
+  "every thumbnail of one video shares an identity",
+);
+check(
+  artworkIdentity("https://lh3.googleusercontent.com/abc=w120")
+    !== artworkIdentity("https://lh3.googleusercontent.com/xyz=w120"),
+  "different covers stay different",
 );
 
 console.log("artwork.check.ts OK");

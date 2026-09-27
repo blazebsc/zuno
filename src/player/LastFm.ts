@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import type { Track } from "../datasource/types";
 import { logInternalDebug, logInternalWarn } from "../internal/logging";
+import { isOnline, onReconnect } from "../internal/connectivity";
 
 export interface LastFmAuthStart {
   token: string;
@@ -78,6 +79,30 @@ function trackKey(track: Track, payload: LastFmTrackPayload) {
   ].join(":");
 }
 
+/*
+ * Scrobbles made offline, sent when the connection is back. Last.fm accepts timestamps up to
+ * two weeks old, so an offline listen still counts instead of being dropped.
+ */
+const PENDING_SCROBBLES_KEY = "zuno.lastfm-pending-scrobbles.v1";
+const MAX_PENDING_SCROBBLES = 500;
+
+function readPendingScrobbles(): LastFmScrobblePayload[] {
+  try {
+    const parsed: unknown = JSON.parse(localStorage.getItem(PENDING_SCROBBLES_KEY) ?? "[]");
+    return Array.isArray(parsed) ? parsed as LastFmScrobblePayload[] : [];
+  } catch {
+    return [];
+  }
+}
+
+function writePendingScrobbles(pending: LastFmScrobblePayload[]): void {
+  try {
+    localStorage.setItem(PENDING_SCROBBLES_KEY, JSON.stringify(pending.slice(-MAX_PENDING_SCROBBLES)));
+  } catch {
+    // Quota or a locked profile: those scrobbles are lost, as they always were before.
+  }
+}
+
 function scrobbleThreshold(duration?: number): number | null {
   if (!duration || duration < MIN_SCROBBLE_DURATION_SEC) return null;
   return Math.min(MAX_THRESHOLD_SEC, duration / 2);
@@ -87,6 +112,7 @@ export class LastFmService {
   private static tracked: TrackedTrackState | null = null;
   private static sessionChecked = false;
   private static hasSession = false;
+  private static flushingPending = false;
 
   static async startAuth(): Promise<LastFmAuthStart> {
     const auth = await invoke<LastFmAuthStart>("lastfm_auth_token");
@@ -198,16 +224,47 @@ export class LastFmService {
 
   private static async scrobble(payload: LastFmScrobblePayload): Promise<void> {
     if (!await this.ensureSession()) return;
+    if (!isOnline()) {
+      writePendingScrobbles([...readPendingScrobbles(), payload]);
+      return;
+    }
     try {
       await invoke("lastfm_scrobble", { input: payload });
       logInternalDebug("LastFm.scrobble.success", {
         artist: payload.artist,
         track: payload.track,
       });
+      void this.flushPendingScrobbles();
     } catch (error) {
+      if (!isOnline()) writePendingScrobbles([...readPendingScrobbles(), payload]);
       logInternalWarn("LastFm.scrobble.failed", {
         error: error instanceof Error ? error.message : String(error),
       });
     }
   }
+
+  /** Sends scrobbles saved while offline, oldest first, stopping at the first failure. */
+  static async flushPendingScrobbles(): Promise<void> {
+    if (this.flushingPending || !isOnline() || readPendingScrobbles().length === 0) return;
+    if (!await this.ensureSession()) return;
+    this.flushingPending = true;
+    let sent = 0;
+    try {
+      for (const payload of readPendingScrobbles()) {
+        await invoke("lastfm_scrobble", { input: payload });
+        sent += 1;
+      }
+    } catch (error) {
+      logInternalWarn("LastFm.pendingScrobbles.failed", {
+        sent,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      // Sliced from the front: anything saved while this ran was appended behind.
+      writePendingScrobbles(readPendingScrobbles().slice(sent));
+      this.flushingPending = false;
+    }
+  }
 }
+
+onReconnect(() => void LastFmService.flushPendingScrobbles());
