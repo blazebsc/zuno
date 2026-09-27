@@ -33,6 +33,7 @@ import type {
   FeedNotification,
   LibrarySnapshot,
   Lyrics,
+  LyricsQuery,
   LyricsSourceAttempt,
   Playlist,
   ResolvedLink,
@@ -4613,7 +4614,7 @@ export class YouTubeMusicDataSource extends DataSource {
     }
   }
 
-  async getLyrics(track: Track): Promise<Lyrics> {
+  async getLyrics(track: Track, query?: LyricsQuery): Promise<Lyrics> {
     /*
      * v3: the cached shape now carries the per-source attempt log, and a v2 entry would
      * leave the lyrics screen unable to say where its words came from.
@@ -4622,12 +4623,18 @@ export class YouTubeMusicDataSource extends DataSource {
      * one key would mean changing the setting appears to do nothing until the cache expires.
      */
     const cacheKey = `lyrics:synced:v3:${getPreferredLyricsSourceId()}:${track.id}`;
-    const cached = await getCachedJson<Lyrics>(cacheKey);
-    if (cached?.timing === "synced" && cached.lines.length > 0) return cached;
+    // A manual search (#89) skips the cache and overwrites it on a synced hit, so the fix sticks.
+    if (!query) {
+      const cached = await getCachedJson<Lyrics>(cacheKey);
+      if (cached?.timing === "synced" && cached.lines.length > 0) return cached;
+    }
+    const searchTrack = query
+      ? { ...track, title: query.title, artist: query.artist, artists: undefined, album: undefined }
+      : track;
 
-    let refresh = this.lyricsRefreshPromises.get(track.id);
+    let refresh = query ? undefined : this.lyricsRefreshPromises.get(track.id);
     if (!refresh) {
-      refresh = this.fetchSyncedLyrics(track).finally(() => {
+      refresh = this.fetchSyncedLyrics(searchTrack).finally(() => {
         this.lyricsRefreshPromises.delete(track.id);
       });
       this.lyricsRefreshPromises.set(track.id, refresh);

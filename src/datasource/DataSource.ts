@@ -11,6 +11,7 @@ import type {
   FeedNotification,
   LibrarySnapshot,
   Lyrics,
+  LyricsQuery,
   Playlist,
   ResolvedLink,
   RustAudioSource,
@@ -170,5 +171,5 @@ export abstract class DataSource {
   /** Discovery shelves for a track: similar artists, related playlists, more from the album. */
   getRelated?(track: Track): Promise<BrowseShelf[]>;
   getBrowsePage?(target: BrowseTarget): Promise<BrowsePage>;
-  getLyrics?(track: Track): Promise<Lyrics | null>;
+  getLyrics?(track: Track, query?: LyricsQuery): Promise<Lyrics | null>;
 }

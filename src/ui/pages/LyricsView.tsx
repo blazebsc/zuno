@@ -1,4 +1,5 @@
 import {
+  type FormEvent,
   type KeyboardEvent,
   memo,
   useCallback,
@@ -10,7 +11,13 @@ import {
 import { useReduceMotion } from "../settings/renderEffects";
 import { cn } from "@/lib/utils";
 import { CloseIcon, FullScreenIcon, LyricsIcon, QuitFullScreenIcon, RefreshIcon } from "@/ui/icons";
-import type { Lyrics, LyricsSourceAttempt, LyricsSourceStatus } from "../../datasource/types";
+import type {
+  Lyrics,
+  LyricsQuery,
+  LyricsSourceAttempt,
+  LyricsSourceStatus,
+  Track,
+} from "../../datasource/types";
 import { LYRICS_SOURCES } from "../../datasource/youtube/lyricsSources";
 import { FloatingPanel } from "../components/FloatingPanel";
 import { logInternalWarn } from "../../internal/logging";
@@ -31,19 +38,18 @@ const AUTO_SCROLL_RESUME_MS = 4500;
 const PAUSED_SAMPLE_MS = 250;
 
 /**
- * Depth by distance from the active line: opacity, then blur.
+ * Depth by distance from the active line, as opacity only.
  *
- * The blur is what makes the column read as a focal plane rather than a dimmed list, but it
- * is a GPU filter and every blurred node is its own layer — so it stops after four lines
- * either side. Past that the opacity alone is low enough that nobody can tell.
+ * No per-line blur: every line re-filtering at once on open, song change and play start
+ * spiked the webview by ~4 GB for seconds (#135, #90).
  */
 const DEPTH = [
-  { opacity: 1, blur: 0 },
-  { opacity: 0.55, blur: 0.7 },
-  { opacity: 0.36, blur: 1.5 },
-  { opacity: 0.24, blur: 2.4 },
-  { opacity: 0.16, blur: 3.2 },
-  { opacity: 0.12, blur: 0 },
+  { opacity: 1 },
+  { opacity: 0.55 },
+  { opacity: 0.36 },
+  { opacity: 0.24 },
+  { opacity: 0.16 },
+  { opacity: 0.12 },
 ];
 
 /*
@@ -88,6 +94,8 @@ export function LyricsView({ onClose }: LyricsViewProps) {
   const [isLoading, setIsLoading] = useState(false);
   const [failed, setFailed] = useState(false);
   const [reloadToken, setReloadToken] = useState(0);
+  // Tagged with its track so skipping to another song drops back to the automatic lookup.
+  const [manualQuery, setManualQuery] = useState<(LyricsQuery & { trackId: string }) | null>(null);
   const [activeIndex, setActiveIndex] = useState(-1);
   const [isFollowPaused, setIsFollowPaused] = useState(false);
   const [focusIndex, setFocusIndex] = useState<number | null>(null);
@@ -144,7 +152,8 @@ export function LyricsView({ onClose }: LyricsViewProps) {
     if (!track) return;
 
     setIsLoading(true);
-    void playerController.getLyrics(track)
+    const query = manualQuery?.trackId === track.id ? manualQuery : undefined;
+    void playerController.getLyrics(track, query)
       .then((result) => {
         if (!cancelled) setLyrics(result);
       })
@@ -162,7 +171,7 @@ export function LyricsView({ onClose }: LyricsViewProps) {
     return () => {
       cancelled = true;
     };
-  }, [track?.id, reloadToken]);
+  }, [track?.id, reloadToken, manualQuery]);
 
   /*
    * Every provider is a network call, so a song opened offline has nothing to show. Retrying
@@ -642,7 +651,16 @@ export function LyricsView({ onClose }: LyricsViewProps) {
             sourceLabel && <span className="truncate">via {sourceLabel}</span>
           )}
         </span>
-        {isSynced && track && <LyricsOffsetControl trackId={track.id} offset={offset} />}
+        {track && (
+          <span className="flex shrink-0 items-center gap-2">
+            <LyricsSearchPanel
+              key={track.id}
+              track={track}
+              onSearch={(query) => setManualQuery({ ...query, trackId: track.id })}
+            />
+            {isSynced && <LyricsOffsetControl trackId={track.id} offset={offset} />}
+          </span>
+        )}
       </footer>
     </section>
   );
@@ -732,7 +750,7 @@ const SyncedLine = memo(function SyncedLine({
       // Using (text-start) instead of (text-left)
       className={cn(
         "group relative origin-left text-pretty text-start font-bold leading-[1.16] tracking-[-0.035em]",
-        "transition-[opacity,filter,color] duration-500 ease-out",
+        "transition-[opacity,color] duration-500 ease-out",
         "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
         /*
          * The sweep paints its own colour through background-clip, so the active line must
@@ -743,10 +761,7 @@ const SyncedLine = memo(function SyncedLine({
         isActive && !reduce ? "lyric-sweep" : "text-foreground",
         !isActive && "hover:opacity-100",
       )}
-      style={{
-        opacity: depth.opacity,
-        filter: depth.blur ? `blur(${depth.blur}px)` : undefined,
-      }}
+      style={{ opacity: depth.opacity }}
       onClick={() => onSeek(index)}
     >
       {/* The one piece of brand colour on the screen, and the only thing marking which line
@@ -854,6 +869,79 @@ function LyricsSourcePanel({
           );
         })}
       </div>
+    </FloatingPanel>
+  );
+}
+
+const SEARCH_INPUT =
+  "w-full min-w-0 rounded-lg bg-background px-2.5 py-1.5 text-sm text-foreground placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring";
+
+/**
+ * Searches the lyric sources with a typed title and artist instead of the video's own.
+ *
+ * Uploads titled "Song / Artist // Letra" on a fan's channel otherwise search for the wrong
+ * song entirely (#89). Pre-filled with the track so a small correction is a small edit.
+ */
+function LyricsSearchPanel({
+  track,
+  onSearch,
+}: {
+  track: Track;
+  onSearch: (query: LyricsQuery) => void;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [title, setTitle] = useState(track.title);
+  const [artist, setArtist] = useState(track.artist);
+
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    if (!title.trim()) return;
+    onSearch({ title: title.trim(), artist: artist.trim() });
+    setIsOpen(false);
+  };
+
+  return (
+    <FloatingPanel
+      open={isOpen}
+      onOpenChange={setIsOpen}
+      side="top"
+      className="w-[18rem]"
+      trigger={
+        <button
+          type="button"
+          className="rounded-full px-1.5 py-0.5 transition-colors hover:bg-card hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          onClick={() => setIsOpen((open) => !open)}
+          aria-expanded={isOpen}
+          aria-haspopup="dialog"
+        >
+          Search lyrics
+        </button>
+      }
+    >
+      <form onSubmit={submit} className="flex flex-col gap-2 p-1">
+        <input
+          autoFocus
+          value={title}
+          onChange={(event) => setTitle(event.target.value)}
+          placeholder="Song title"
+          aria-label="Song title"
+          className={SEARCH_INPUT}
+        />
+        <input
+          value={artist}
+          onChange={(event) => setArtist(event.target.value)}
+          placeholder="Artist"
+          aria-label="Artist"
+          className={SEARCH_INPUT}
+        />
+        <button
+          type="submit"
+          disabled={!title.trim()}
+          className="self-end rounded-full bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          Search
+        </button>
+      </form>
     </FloatingPanel>
   );
 }

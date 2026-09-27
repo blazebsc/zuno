@@ -1,5 +1,5 @@
 import type { DataSource, StreamData } from "../datasource/DataSource";
-import type { Lyrics, Track } from "../datasource/types";
+import type { Lyrics, LyricsQuery, Track } from "../datasource/types";
 import { logInternalDebug, logInternalError, logInternalInfo, logInternalWarn } from "../internal/logging";
 import { isPrematureEnd } from "./prematureEnd";
 import { AudioEngine, isEmbedRestrictedPlaybackError } from "./AudioEngine";
@@ -1920,7 +1920,7 @@ export class PlayerController {
     savePlaybackSettings(this.currentPlaybackSettings());
   }
 
-  async getLyrics(track: Track): Promise<Lyrics | null> {
-    return this.dataSource.getLyrics?.(track) ?? null;
+  async getLyrics(track: Track, query?: LyricsQuery): Promise<Lyrics | null> {
+    return this.dataSource.getLyrics?.(track, query) ?? null;
   }
 }
