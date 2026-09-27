@@ -1,4 +1,4 @@
-use crate::{CommandError, KEYRING_SERVICE};
+use crate::{http_client_builder, CommandError, KEYRING_SERVICE};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -131,7 +131,11 @@ async fn signed_lastfm_post<T: for<'de> Deserialize<'de>>(
     params.insert("api_sig".to_string(), signature);
     params.insert("format".to_string(), "json".to_string());
 
-    let response = reqwest::Client::new()
+    let response = http_client_builder()
+        .build()
+        .map_err(|error| CommandError {
+            message: format!("Last.fm client creation failed: {error}"),
+        })?
         .post(LASTFM_API_URL)
         .form(&params)
         .send()

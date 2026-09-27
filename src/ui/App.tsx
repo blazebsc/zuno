@@ -1772,13 +1772,16 @@ useEffect(() => {
         await placeMiniPlayerAtBottomCenter(miniWin);
       } catch (_) {}
 
-      await miniWin.show();
-      if (isLinux) {
-        try {
-          await placeMiniPlayerAtBottomCenter(miniWin);
-        } catch (_) {}
-      }
-      await miniWin.setFocus();
+      // Focus coming back mid-show destroys the window under these calls ("window not found").
+      try {
+        await miniWin.show();
+        if (isLinux) {
+          try {
+            await placeMiniPlayerAtBottomCenter(miniWin);
+          } catch (_) {}
+        }
+        await miniWin.setFocus();
+      } catch (_) {}
     };
 
     /*
