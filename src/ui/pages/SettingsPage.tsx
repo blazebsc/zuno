@@ -1729,7 +1729,7 @@ export function SettingsPage({
 
             <SettingToggle
               title="Minimize to tray"
-              description="Closing the window hides Zuno to the system tray and keeps playing. Quit from the tray icon."
+              description="Closing the window hides Zuno to the system tray and keeps playing. When off, no tray icon is shown."
               checked={minimizeToTray}
               onCheckedChange={setMinimizeToTray}
             />

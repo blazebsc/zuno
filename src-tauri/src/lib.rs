@@ -1225,6 +1225,9 @@ fn app_setting_set(
         message: "application settings lock unavailable".to_string(),
     })?;
     let mut settings = read_app_settings(&app)?;
+    if key == MINIMIZE_TO_TRAY_SETTING {
+        set_tray_visible(&app, value.as_bool().unwrap_or(false));
+    }
     settings.insert(key, value);
     write_json_file(&app_settings_path(&app)?, &settings)
 }
@@ -1646,6 +1649,13 @@ fn close_or_hide_main_window(app: &tauri::AppHandle) {
         return;
     }
     app.exit(0);
+}
+
+// The tray only exists to bring back a hidden window, so it follows minimize-to-tray (#145).
+fn set_tray_visible(app: &tauri::AppHandle, visible: bool) {
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        let _ = tray.set_visible(visible);
+    }
 }
 
 fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
@@ -5346,6 +5356,7 @@ pub fn run() {
             if let Err(error) = build_tray(app.handle()) {
                 std::eprintln!("[internal][tauri][warn] tray unavailable: {error}");
             }
+            set_tray_visible(app.handle(), minimize_to_tray_enabled(app.handle()));
             Ok(())
         })
         .on_window_event(move |window, event| match event {
