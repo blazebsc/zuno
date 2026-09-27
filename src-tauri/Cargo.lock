@@ -6904,6 +6904,8 @@ dependencies = [
  "rand 0.8.6",
  "reqwest 0.12.28",
  "rodio",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "souvlaki",

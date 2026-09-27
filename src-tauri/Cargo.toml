@@ -27,6 +27,8 @@ portpicker = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli", "deflate", "stream"] }
+rustls = { version = "0.23", default-features = false, features = ["std"] }
+rustls-native-certs = "0.8"
 base64 = "0.22"
 url = "2.5"
 keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync-secret-service"] }
