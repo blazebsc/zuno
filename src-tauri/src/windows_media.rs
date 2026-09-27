@@ -13,7 +13,6 @@ use windows::{
     },
     Media::{
         MediaPlaybackStatus, MediaPlaybackType, SystemMediaTransportControls,
-        SystemMediaTransportControlsButton, SystemMediaTransportControlsButtonPressedEventArgs,
         SystemMediaTransportControlsTimelineProperties,
     },
     Storage::Streams::RandomAccessStreamReference,
@@ -71,7 +70,6 @@ struct NativeMediaSession {
     _pause_token: i64,
     _next_token: i64,
     _previous_token: i64,
-    _button_pressed_token: i64,
 }
 
 impl WindowsMediaSession {
@@ -188,27 +186,7 @@ impl NativeMediaSession {
             }))
             .map_err(|error| error.to_string())?;
 
-        let button_pressed_app = app.clone();
-        let button_pressed_token = controls
-            .ButtonPressed(&TypedEventHandler::<
-                SystemMediaTransportControls,
-                SystemMediaTransportControlsButtonPressedEventArgs,
-            >::new(move |_sender, args| {
-                let Some(args) = args.as_ref() else {
-                    return Ok(());
-                };
-                let action = match args.Button()? {
-                    SystemMediaTransportControlsButton::Next => Some("next"),
-                    SystemMediaTransportControlsButton::Previous => Some("previous"),
-                    _ => None,
-                };
-                if let Some(action) = action {
-                    let _ = button_pressed_app.emit(MEDIA_CONTROL_EVENT, action);
-                }
-                Ok(())
-            }))
-            .map_err(|error| error.to_string())?;
-
+        // No ButtonPressed handler: Next/PreviousReceived already fire for it; both skipped twice (#136).
         let taskbar_toolbar = ThumbnailToolbar::new(&app).ok();
 
         Ok(Self {
@@ -221,7 +199,6 @@ impl NativeMediaSession {
             _pause_token: pause_token,
             _next_token: next_token,
             _previous_token: previous_token,
-            _button_pressed_token: button_pressed_token,
         })
     }
 
