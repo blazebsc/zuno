@@ -50,6 +50,12 @@ export interface LyricsSourceAttempt {
   detail?: string;
 }
 
+/** A listener-typed title and artist, replacing the track's own for one lookup. */
+export interface LyricsQuery {
+  title: string;
+  artist: string;
+}
+
 export interface Lyrics {
   lines: LyricLine[];
   timing: "synced" | "estimated" | "none";

@@ -153,8 +153,8 @@ class ActivePlayerController implements PlayerControllerActions {
     tabManager.getActivePlayer().setSleepTimer(minutes);
   getSleepTimerRemainingMs = () =>
     tabManager.getActivePlayer().getSleepTimerRemainingMs();
-  getLyrics = (track: Parameters<PlayerController["getLyrics"]>[0]) =>
-    tabManager.getActivePlayer().getLyrics(track);
+  getLyrics = (...args: Parameters<PlayerController["getLyrics"]>) =>
+    tabManager.getActivePlayer().getLyrics(...args);
   getPlayerSession = () => tabManager.getActivePlayer().exportSession();
   removeFromQueueAt = (index: number) => tabManager.getActivePlayer().removeFromQueueAt(index);
   playQueueTrackAt = (index: number) => tabManager.getActivePlayer().playQueueTrackAt(index);

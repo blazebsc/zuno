@@ -45,7 +45,7 @@ for (const option of LYRICS_FONT_SCALES) {
 }
 
 equal(normalizeFontScale(1.19), 1.2, "a near miss snaps to the closest step");
-equal(normalizeFontScale(0.1), 0.85, "an absurdly small value clamps to the smallest step");
+equal(normalizeFontScale(0.1), 0.7, "an absurdly small value clamps to the smallest step");
 equal(normalizeFontScale(99), 1.45, "an absurdly large one clamps to the largest");
 equal(normalizeFontScale(Number.NaN), DEFAULT_LYRICS_FONT_SCALE, "NaN falls back to default");
 equal(

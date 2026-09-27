@@ -49,7 +49,7 @@ export const RENDER_EFFECTS = [
   {
     id: "filters",
     label: "Blur and colour filters",
-    description: "Blurred artwork washes and the lyrics depth-of-field.",
+    description: "Blurred artwork washes.",
   },
   {
     id: "shadows",
