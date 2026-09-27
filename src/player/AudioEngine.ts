@@ -210,7 +210,12 @@ function loadYouTubeIframeApi(): Promise<void> {
     const script = document.createElement("script");
     script.src = "https://www.youtube.com/iframe_api";
     script.async = true;
-    script.onerror = () => reject(new Error("Unable to load the YouTube player API."));
+    script.onerror = () => {
+      // Not cached: loaded offline at launch, it used to stay broken for the whole session.
+      script.remove();
+      iframeApiPromise = null;
+      reject(new Error("Unable to load the YouTube player API."));
+    };
     document.head.appendChild(script);
   });
 

@@ -15,7 +15,7 @@ use windows::{
         MediaPlaybackStatus, MediaPlaybackType, SystemMediaTransportControls,
         SystemMediaTransportControlsTimelineProperties,
     },
-    Storage::Streams::RandomAccessStreamReference,
+    Storage::{StorageFile, Streams::RandomAccessStreamReference},
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, RPC_E_CHANGED_MODE, WPARAM},
         System::Com::{
@@ -248,14 +248,10 @@ impl NativeMediaSession {
                 })
                 .map_err(|error| error.to_string())?;
 
-            if let Some(artwork_url) = metadata.artwork_url.as_ref() {
-                if let Ok(uri) = Uri::CreateUri(&HSTRING::from(artwork_url.as_str())) {
-                    if let Ok(thumbnail) = RandomAccessStreamReference::CreateFromUri(&uri) {
-                        updater
-                            .SetThumbnail(&thumbnail)
-                            .map_err(|error| error.to_string())?;
-                    }
-                }
+            if let Some(thumbnail) = metadata.artwork_url.as_deref().and_then(artwork_stream) {
+                updater
+                    .SetThumbnail(&thumbnail)
+                    .map_err(|error| error.to_string())?;
             }
         }
 
@@ -313,6 +309,15 @@ impl MediaMetadata {
             artwork_url: update.artwork_url.clone(),
         })
     }
+}
+
+/// A downloaded song's saved cover is a `file://` path; anything else is a URL the shell fetches.
+fn artwork_stream(url: &str) -> Option<RandomAccessStreamReference> {
+    if let Some(path) = url.strip_prefix("file://") {
+        let file = StorageFile::GetFileFromPathAsync(&HSTRING::from(path)).ok()?.get().ok()?;
+        return RandomAccessStreamReference::CreateFromFile(&file).ok();
+    }
+    RandomAccessStreamReference::CreateFromUri(&Uri::CreateUri(&HSTRING::from(url)).ok()?).ok()
 }
 
 fn duration_to_timespan(seconds: f64) -> windows::Foundation::TimeSpan {
@@ -603,5 +608,9 @@ pub fn update_windows_media_session(
     state: tauri::State<'_, WindowsMediaSession>,
     update: MediaSessionUpdate,
 ) -> Result<(), String> {
+    let mut update = update;
+    if let Some(path) = update.artwork_url.as_deref().and_then(|url| crate::offline_artwork_file(&app, url)) {
+        update.artwork_url = Some(format!("file://{}", path.display()));
+    }
     state.with_session(&app, |session| session.update(update))
 }

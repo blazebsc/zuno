@@ -24,6 +24,7 @@ import { useNowPlaying } from "../hooks/useNowPlaying";
 import { useKeyboardShortcuts } from "../settings/keyboardShortcuts";
 import { shouldStartPageSearch } from "./pageSearchKeyboard";
 import { collectTrackPages } from "./collectTrackPages";
+import { loadFailedMessage } from "../../internal/connectivity";
 
 /*
  * Collapsed search affordance that widens on hover/focus or while it holds a query —
@@ -328,7 +329,7 @@ export function PlaylistView({ playlist, playerController, libraryController }: 
         showPage(page);
       })
       .catch(() => {
-        if (active && !showedPage) setError("Unable to load this playlist.");
+        if (active && !showedPage) setError(loadFailedMessage("Unable to load this playlist."));
       })
       .finally(() => {
         if (active) setIsLoading(false);
@@ -385,7 +386,7 @@ export function PlaylistView({ playlist, playerController, libraryController }: 
       setNextPageKey(page.nextPageKey);
     } catch {
       if (playlistIdRef.current === loadingPlaylistId) {
-        setLoadMoreError("Could not load more songs.");
+        setLoadMoreError(loadFailedMessage("Could not load more songs."));
       }
     } finally {
       if (playlistIdRef.current === loadingPlaylistId) {
@@ -434,7 +435,7 @@ export function PlaylistView({ playlist, playerController, libraryController }: 
       });
     } catch {
       if (playlistIdRef.current === loadingPlaylistId) {
-        setLoadMoreError("Could not load the rest of this playlist.");
+        setLoadMoreError(loadFailedMessage("Could not load the rest of this playlist."));
       }
       return tracksRef.current;
     } finally {

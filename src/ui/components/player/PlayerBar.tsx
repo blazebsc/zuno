@@ -4,6 +4,7 @@ import { SpinnerSteps } from "@/components/motion/loader";
 import { cn } from "@/lib/utils";
 import { PlayActiveIcon, QueuePanelIcon } from "@/ui/icons";
 import { tauriFetch } from "../../../datasource/youtube/tauriFetch";
+import { setOnline, useOnline } from "../../../internal/connectivity";
 import { TrackInfo } from "./TrackInfo";
 import { PlaybackControls } from "./PlaybackControls";
 import { SeekBar } from "./SeekBar";
@@ -36,7 +37,7 @@ const CONNECTION_CHECK_URLS = [
 ];
 
 export function PlayerBar({ onToggleLyrics, onToggleQueue, isQueueOpen, onConnectionRestored,handlePlayerBarClick }: PlayerBarProps) {
-  const [isOnline, setIsOnline] = useState(() => navigator.onLine);
+  const isOnline = useOnline();
   const [isCheckingConnection, setIsCheckingConnection] = useState(false);
  
   const connectionCheckRef = useRef<Promise<boolean> | null>(null);
@@ -46,7 +47,7 @@ export function PlayerBar({ onToggleLyrics, onToggleQueue, isQueueOpen, onConnec
 
   const updateConnectionState = useCallback((connected: boolean) => {
     if (connected) failedChecksRef.current = 0;
-    setIsOnline(connected);
+    setOnline(connected);
 
     if (!connected) {
       wasOfflineRef.current = true;

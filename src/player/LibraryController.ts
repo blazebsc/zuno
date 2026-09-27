@@ -24,6 +24,7 @@ import type {
   TrackRating,
 } from "../datasource/types";
 import { logInternalError, logInternalInfo } from "../internal/logging";
+import { isOnline } from "../internal/connectivity";
 import { getAppSetting, setAppSetting } from "../internal/appSettings";
 import { forgetTrackInPlaylist, rememberTrackInPlaylist } from "./playlistMembership";
 import {
@@ -1102,7 +1103,10 @@ export class LibraryController {
     const detail = error instanceof Error ? error.message : String(error);
     this.setState({
       status: "error",
-      error: detail && detail !== "[object Object]" ? `${message}\n\n${detail}` : message,
+      // recoverConnection retries on reconnect, so offline this is a wait, not a failure.
+      error: !isOnline()
+        ? "You're offline. Zuno will retry when you reconnect."
+        : detail && detail !== "[object Object]" ? `${message}\n\n${detail}` : message,
       authPrompt: null,
     });
   }

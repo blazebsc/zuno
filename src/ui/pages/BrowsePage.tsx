@@ -19,6 +19,7 @@ import { BrowseShelves } from "../components/BrowseShelves";
 import { TrackRow } from "../components/TrackRow";
 import { useTrackContextMenu } from "../components/TrackContextMenu";
 import { useNowPlaying } from "../hooks/useNowPlaying";
+import { loadFailedMessage } from "../../internal/connectivity";
 
 /**
  * "downloads" is not a YouTube feed — it reads from the offline store on this machine. It
@@ -116,7 +117,7 @@ export function BrowsePage({
       })
       .catch((cause: unknown) => {
         logInternalError("BrowsePage.load failed", cause, { surface });
-        if (!cancelled) setError("Could not load this feed.");
+        if (!cancelled) setError(loadFailedMessage("Could not load this feed."));
       });
 
     return () => {

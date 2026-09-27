@@ -157,5 +157,10 @@ pub fn update_linux_media_session(
     state: State<'_, LinuxMediaSession>,
     update: MediaSessionUpdate,
 ) -> Result<(), String> {
+    // MPRIS takes `file://` covers, which is how a downloaded song keeps its artwork offline.
+    let mut update = update;
+    if let Some(path) = update.artwork_url.as_deref().and_then(|url| crate::offline_artwork_file(&app, url)) {
+        update.artwork_url = Some(format!("file://{}", path.display()));
+    }
     state.update(&app, update)
 }

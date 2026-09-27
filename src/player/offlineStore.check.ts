@@ -10,7 +10,7 @@
  */
 export {};
 
-import { reconcileManifest, type OfflineEntry } from "./offlineStore";
+import { matchesDownloadQuery, reconcileManifest, type OfflineEntry } from "./offlineStore";
 
 function check(condition: boolean, message: string): void {
   if (!condition) throw new Error(`FAILED: ${message}`);
@@ -60,5 +60,20 @@ const lostManifest = reconcileManifest({}, [
 ]);
 equal(lostManifest.entries, {}, "no manifest means nothing is playable yet");
 equal(lostManifest.orphans, [], "but the files are left alone to be recovered");
+
+// Disk also decides which downloads have a saved cover, so artwork is never offered for a missing file.
+const withArtwork = reconcileManifest(manifest, [
+  { trackId: "a", byteLength: 100, hasArtwork: true },
+  { trackId: "b", byteLength: 200 },
+]);
+equal(withArtwork.entries.a.hasArtwork, true, "a cover on disk is recorded");
+equal(withArtwork.entries.b.hasArtwork, false, "a missing cover is not");
+
+// Offline search runs over downloads, word by word, in any order and any case.
+const song = { id: "x", title: "El baile de los que sobran", artist: "Los Prisioneros", album: "Pateando piedras" } as OfflineEntry["track"];
+check(matchesDownloadQuery(song, "prisioneros BAILE"), "words match across title and artist in any order");
+check(matchesDownloadQuery(song, "pateando"), "the album counts");
+check(!matchesDownloadQuery(song, "baile soda"), "every word has to match");
+check(!matchesDownloadQuery(song, "   "), "a blank query matches nothing");
 
 console.log("offlineStore.check passed");

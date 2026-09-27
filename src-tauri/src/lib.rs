@@ -730,19 +730,25 @@ fn read_image_file(path: String) -> Result<LocalArtwork, CommandError> {
         return Err(cache_error("that image is too large to embed"));
     }
 
-    let mime_type = match data.as_slice() {
-        [0xff, 0xd8, 0xff, ..] => "image/jpeg",
-        [0x89, b'P', b'N', b'G', ..] => "image/png",
-        [b'G', b'I', b'F', b'8', ..] => "image/gif",
-        [b'B', b'M', ..] => "image/bmp",
-        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => "image/webp",
-        _ => return Err(cache_error("that file is not a PNG, JPEG, GIF, BMP or WebP image")),
+    let Some(mime_type) = sniff_image_mime(&data) else {
+        return Err(cache_error("that file is not a PNG, JPEG, GIF, BMP or WebP image"));
     };
 
     Ok(LocalArtwork {
         mime_type: mime_type.to_string(),
         data_base64: base64::engine::general_purpose::STANDARD.encode(&data),
     })
+}
+
+fn sniff_image_mime(data: &[u8]) -> Option<&'static str> {
+    match data {
+        [0xff, 0xd8, 0xff, ..] => Some("image/jpeg"),
+        [0x89, b'P', b'N', b'G', ..] => Some("image/png"),
+        [b'G', b'I', b'F', b'8', ..] => Some("image/gif"),
+        [b'B', b'M', ..] => Some("image/bmp"),
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some("image/webp"),
+        _ => None,
+    }
 }
 
 /// The first embedded picture, for the one file the UI is about to show.
@@ -3183,6 +3189,7 @@ fn offline_entry_path(app: &tauri::AppHandle, track_id: &str) -> Result<PathBuf,
 struct OfflineEntryInfo {
     track_id: String,
     byte_length: u64,
+    has_artwork: bool,
 }
 
 #[derive(Serialize)]
@@ -3675,11 +3682,69 @@ fn offline_audio_has(app: tauri::AppHandle, track_id: String) -> Result<bool, Co
 #[tauri::command]
 fn offline_audio_remove(app: tauri::AppHandle, track_id: String) -> Result<(), CommandError> {
     let path = offline_entry_path(&app, &track_id)?;
+    let _ = fs::remove_file(path.with_extension("art"));
     if path.exists() {
         fs::remove_file(&path)
             .map_err(|error| cache_error(format!("offline delete failed: {error}")))?;
     }
     Ok(())
+}
+
+/// The saved cover behind an `offline-artwork:<trackId>` URL, for the OS media controls.
+pub(crate) fn offline_artwork_file(app: &tauri::AppHandle, url: &str) -> Option<PathBuf> {
+    let track_id = url.strip_prefix("offline-artwork:")?;
+    let path = offline_entry_path(app, track_id).ok()?.with_extension("art");
+    path.is_file().then_some(path)
+}
+
+/// Saves a downloaded track's cover next to its audio, so it still shows with no network.
+#[tauri::command]
+async fn offline_artwork_save(
+    app: tauri::AppHandle,
+    track_id: String,
+    url: String,
+) -> Result<(), CommandError> {
+    let path = offline_entry_path(&app, &track_id)?.with_extension("art");
+    if !url.starts_with("https://") {
+        return Err(cache_error("artwork URL must be https"));
+    }
+    let client = http_client_builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|error| cache_error(format!("artwork client creation failed: {error}")))?;
+    let bytes = client
+        .get(&url)
+        .send()
+        .await
+        .and_then(|response| response.error_for_status())
+        .map_err(|error| cache_error(format!("artwork request failed: {error}")))?
+        .bytes()
+        .await
+        .map_err(|error| cache_error(format!("artwork read failed: {error}")))?;
+    if bytes.len() > MAX_ARTWORK_BYTES || sniff_image_mime(&bytes).is_none() {
+        return Err(cache_error("artwork response is not a usable image"));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| cache_error(format!("offline directory creation failed: {error}")))?;
+    }
+    fs::write(&path, &bytes).map_err(|error| cache_error(format!("artwork save failed: {error}")))
+}
+
+#[tauri::command]
+fn offline_artwork(app: tauri::AppHandle, track_id: String) -> Result<Option<LocalArtwork>, CommandError> {
+    use base64::Engine;
+
+    let path = offline_entry_path(&app, &track_id)?.with_extension("art");
+    let data = match fs::read(&path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(cache_error(format!("artwork read failed: {error}"))),
+    };
+    Ok(sniff_image_mime(&data).map(|mime_type| LocalArtwork {
+        mime_type: mime_type.to_string(),
+        data_base64: base64::engine::general_purpose::STANDARD.encode(&data),
+    }))
 }
 
 /// The source of truth for what is downloaded. The frontend keeps its own manifest for track
@@ -3705,6 +3770,7 @@ fn offline_audio_list(app: tauri::AppHandle) -> Result<Vec<OfflineEntryInfo>, Co
         entries.push(OfflineEntryInfo {
             track_id: track_id.to_string(),
             byte_length: entry.metadata().map(|meta| meta.len()).unwrap_or(0),
+            has_artwork: path.with_extension("art").exists(),
         });
     }
     Ok(entries)
@@ -3756,6 +3822,7 @@ fn offline_audio_prune(app: tauri::AppHandle, max_bytes: u64) -> Result<OfflineS
             break;
         }
         if fs::remove_file(path).is_ok() {
+            let _ = fs::remove_file(path.with_extension("art"));
             used_bytes = used_bytes.saturating_sub(*size);
             entry_count = entry_count.saturating_sub(1);
         }
@@ -5430,6 +5497,8 @@ pub fn run() {
             offline_audio_has,
             offline_audio_remove,
             offline_audio_list,
+            offline_artwork_save,
+            offline_artwork,
             offline_audio_stats,
             offline_audio_prune,
             fetch_youtube_music_audio,

@@ -7,7 +7,9 @@ import { Queue } from "./Queue";
 import { NavigationCoalescer } from "./navigationCoalescer";
 import { recordPlay } from "./playHistory";
 import { computeQueueWindow } from "./queueWindow";
-import { getOfflineTrack, isTrackDownloaded } from "./offlineStore";
+import { getOfflineTrack, isPlayableOffline, isTrackDownloaded } from "./offlineStore";
+import { isOnline } from "../internal/connectivity";
+import { findPlayableIndex } from "./playableIndex";
 import { hasPreloadDeck } from "./preloadDeck";
 import { getAudioEngineMode } from "../ui/settings/audioEngine";
 import { DiscordRpcService } from "./DiscordRPC";
@@ -828,7 +830,8 @@ export class PlayerController {
 
   private async skipToNextNow(): Promise<void> {
     const shouldResume = this.shouldResumeAfterNavigation();
-    const nextTrack = this.queue.next(false);
+    const nextTrack = this.nextPlayableTrack();
+    if (!isOnline() && (!nextTrack || nextTrack.id === this.state.currentTrack?.id)) return;
     if (
       (!nextTrack || nextTrack.id === this.state.currentTrack?.id)
       && this.state.currentTrack
@@ -987,11 +990,17 @@ export class PlayerController {
         return;
       }
 
-      const nextTrack = this.queue.next(false);
+      const nextTrack = this.nextPlayableTrack();
 
       if (nextTrack && nextTrack.id !== this.state.currentTrack?.id) {
         this.refillAutomaticQueue();
         await this.playTrackById(nextTrack.id);
+        return;
+      }
+
+      // Looping and recommendations both need the network; offline, the queue just ends.
+      if (!isOnline()) {
+        this.setState({ status: "paused" });
         return;
       }
 
@@ -1221,6 +1230,10 @@ export class PlayerController {
       });
       return;
     }
+    // Fails fast rather than waiting out network timeouts; setError explains it's offline.
+    if (!isOnline() && !isPlayableOffline(track)) {
+      throw new Error("Not available offline.");
+    }
 
     try {
       const startedAt = performance.now();
@@ -1442,10 +1455,30 @@ export class PlayerController {
    * crossfade into. Repeat-one is excluded because the "next" track is the current one, and
    * handing the deck to itself is not a transition.
    */
+  /**
+   * The queue's next track, stepping over songs that cannot play offline.
+   *
+   * Without this a partly downloaded playlist stopped at its first gap with a network error.
+   */
+  private nextPlayableTrack(): Track | null {
+    return this.stepToPlayable(1);
+  }
+
+  /** One step through the queue; offline, past songs that cannot play, and nowhere if none can. */
+  private stepToPlayable(direction: 1 | -1): Track | null {
+    if (isOnline()) return direction === 1 ? this.queue.next(false) : this.queue.prev(false);
+    const index = findPlayableIndex(this.queue.all, this.queue.currentIndex, direction, isPlayableOffline);
+    return index === -1 ? null : this.queue.select(index);
+  }
+
   private peekNextTrack(): Track | null {
     if (this.playbackOrderMode === "repeat-one") return null;
 
-    const next = this.queue.all[this.queue.currentIndex + 1] ?? null;
+    // Offline, gapless preloading targets the song that will actually play next.
+    const index = isOnline()
+      ? this.queue.currentIndex + 1
+      : findPlayableIndex(this.queue.all, this.queue.currentIndex, 1, isPlayableOffline);
+    const next = this.queue.all[index] ?? null;
     if (!next || next.id === this.state.currentTrack?.id) return null;
     return next;
   }
@@ -1655,12 +1688,16 @@ export class PlayerController {
       trackId: this.state.currentTrack?.id,
     });
     const detail = getErrorMessage(error);
+    const track = this.state.currentTrack;
+    const offlineMiss = !isOnline() && track && !isPlayableOffline(track);
 
     this.setState({
       status: "error",
-      error: detail && detail !== "[object Object]"
-        ? `Playback failed. ${detail}`
-        : "Playback failed. Check internal logs for details.",
+      error: offlineMiss
+        ? "You're offline. Only downloaded songs can play until you reconnect."
+        : detail && detail !== "[object Object]"
+          ? `Playback failed. ${detail}`
+          : "Playback failed. Check internal logs for details.",
       // Preserve currentTrack to prevent reversion to hardcoded track
       currentTrack: this.state.currentTrack,
     });
@@ -1806,7 +1843,7 @@ export class PlayerController {
 
   private async skipToPreviousNow(): Promise<void> {
     const shouldResume = this.shouldResumeAfterNavigation();
-    let previousTrack = this.queue.prev(false);
+    let previousTrack = this.stepToPlayable(-1);
     if (!previousTrack || previousTrack.id === this.state.currentTrack?.id) {
       let currentHistoryIndex = -1;
       for (let index = this.state.history.length - 1; index >= 0; index -= 1) {
@@ -1818,6 +1855,7 @@ export class PlayerController {
       previousTrack = currentHistoryIndex > 0
         ? this.state.history[currentHistoryIndex - 1]
         : null;
+      if (previousTrack && !isOnline() && !isPlayableOffline(previousTrack)) previousTrack = null;
     }
     logInternalInfo("PlayerController.skipToPrevious", {
       currentTrackId: this.state.currentTrack?.id ?? null,

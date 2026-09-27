@@ -130,6 +130,20 @@ export function getArtworkUrlCandidates(url?: string, size?: number | null): str
   });
 }
 
+/**
+ * One key per image whatever size variant a URL asks for, so a download's saved cover matches
+ * the same song wherever it shows — a queue row's `=w120` and a header's `=w544` alike.
+ */
+export function artworkIdentity(url: string): string {
+  const normalized = normalizeArtworkUrl(url);
+  const videoThumbnail = normalized.match(/^https:\/\/i\d?\.ytimg\.com\/vi(?:_webp)?\/([^/]+)\//);
+  if (videoThumbnail) return `ytimg:${videoThumbnail[1]}`;
+  if (/googleusercontent\.com|ggpht\.com/.test(normalized) && !/[?&]/.test(normalized)) {
+    return normalized.replace(/=[^=/]+$/, "");
+  }
+  return normalized;
+}
+
 export function getVideoArtworkFallback(videoId: string): string | undefined {
   return /^[A-Za-z0-9_-]{11}$/.test(videoId)
     ? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`

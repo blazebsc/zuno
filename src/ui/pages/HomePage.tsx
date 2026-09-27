@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type MouseEvent, useEffect, useMemo, useRef, useState } from "react";
 import { CylinderCarousel } from "@/components/motion/cylinder-carousel";
 import { PlayActiveIcon } from "@/ui/icons";
 import type { Track } from "../../datasource/types";
@@ -15,6 +15,10 @@ import { ArtistLinks } from "../components/ArtistLinks";
 import { usePlayHistory } from "../../player/playHistory";
 import { useMadeForYouVisible } from "../settings/homeSections";
 import { AlbumGridSkeleton, PickCardSkeleton, TrackRowSkeleton } from "../components/Skeleton";
+import { TrackRow } from "../components/TrackRow";
+import { useNowPlaying } from "../hooks/useNowPlaying";
+import { isOnline, useOnline } from "../../internal/connectivity";
+import { useOfflineEntries } from "../../player/offlineStore";
 
 const FALLBACK_QUERIES = [
   "new music",
@@ -170,6 +174,15 @@ export function HomePage({
     () => uniqueTracks([...playHistory.map((entry) => entry.track), ...recentlyPlayed]),
     [playHistory, recentlyPlayed],
   );
+  const online = useOnline();
+  const offlineEntries = useOfflineEntries();
+  const downloads = useMemo(
+    () => Object.values(offlineEntries)
+      .sort((left, right) => right.downloadedAt - left.downloadedAt)
+      .map((entry) => entry.track),
+    [offlineEntries],
+  );
+  const { currentTrackId, isPlaying } = useNowPlaying();
   const isWaitingForLibrary = !libraryState.library
     && (
       libraryState.status === "restoring"
@@ -178,6 +191,8 @@ export function HomePage({
     );
 
   useEffect(() => {
+    // Offline, every recommendation fails; `online` in the deps reloads them on reconnect.
+    if (!online) return;
     if (isWaitingForLibrary) {
       loadIdRef.current += 1;
       setSuggestions([]);
@@ -225,13 +240,15 @@ export function HomePage({
     }
 
     void loadPromise.then((loadedSuggestions) => {
-      writeSuggestionCache(suggestionCacheKey, loadedSuggestions);
+      // A load that lost the network is a fallback, not a result worth keeping.
+      if (isOnline()) writeSuggestionCache(suggestionCacheKey, loadedSuggestions);
       suggestionLoads.delete(suggestionCacheKey);
       if (loadId !== loadIdRef.current) return;
       setSuggestions(loadedSuggestions);
       setIsLoadingSuggestions(false);
     });
   }, [
+    online,
     isWaitingForLibrary,
     libraryController,
     recentlyPlayed,
@@ -345,6 +362,19 @@ export function HomePage({
 
     </section>
   );
+
+  if (!online) {
+    return (
+      <OfflineHome
+        downloads={downloads}
+        currentTrackId={currentTrackId}
+        isPlaying={isPlaying}
+        onPlay={(track) => playerController.playTrackById(track.id, downloads)}
+        onContextMenu={openTrackMenu}
+        onOpenDownloads={destinations.onOpenDownloads}
+      />
+    );
+  }
 
   return (
     <div className="flex flex-col gap-8">
@@ -469,6 +499,72 @@ export function HomePage({
             </button>
           )}
         </div>
+      )}
+    </div>
+  );
+}
+
+const OFFLINE_HOME_LIMIT = 50;
+
+/**
+ * Home with no connection: the downloads, since they are the only thing that can play.
+ *
+ * The online feed is recommendations and history, which offline is a wall of songs that fail.
+ */
+function OfflineHome({
+  downloads,
+  currentTrackId,
+  isPlaying,
+  onPlay,
+  onContextMenu,
+  onOpenDownloads,
+}: {
+  downloads: Track[];
+  currentTrackId: string | null;
+  isPlaying: boolean;
+  onPlay: (track: Track) => void;
+  onContextMenu: (event: MouseEvent<HTMLElement>, track: Track) => void;
+  onOpenDownloads: () => void;
+}) {
+  return (
+    <div className="flex flex-col gap-6">
+      <header className="flex flex-col gap-1" role="status">
+        <h1 className="text-3xl font-bold tracking-[-0.02em] text-foreground">You&apos;re offline</h1>
+        <p className="text-sm text-muted-foreground">
+          {downloads.length > 0
+            ? "Your downloaded songs play without a connection."
+            : "Nothing is downloaded yet. Songs you download play here when you're offline."}
+        </p>
+      </header>
+
+      {downloads.length > 0 && (
+        <section className="flex flex-col gap-3">
+          <div className="flex items-center justify-between gap-3">
+            <h2 className="text-xl font-semibold text-foreground">Downloads</h2>
+            {downloads.length > OFFLINE_HOME_LIMIT && (
+              <button
+                type="button"
+                className="rounded-full px-3 py-1.5 text-sm text-muted-foreground transition-colors hover:bg-card hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                onClick={onOpenDownloads}
+              >
+                See all {downloads.length}
+              </button>
+            )}
+          </div>
+          <div className="flex flex-col gap-0.5">
+            {downloads.slice(0, OFFLINE_HOME_LIMIT).map((track, index) => (
+              <TrackRow
+                key={track.id}
+                track={track}
+                index={index}
+                isCurrent={currentTrackId === track.id}
+                isPlaying={isPlaying && currentTrackId === track.id}
+                onSelect={() => onPlay(track)}
+                onContextMenu={(event) => onContextMenu(event, track)}
+              />
+            ))}
+          </div>
+        </section>
       )}
     </div>
   );

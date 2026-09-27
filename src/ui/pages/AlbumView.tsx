@@ -16,6 +16,7 @@ import { ArtistLinks } from "../components/ArtistLinks";
 import { formatCollectionMeta, MediaHeader } from "../components/MediaHeader";
 import { useKeyboardShortcuts } from "../settings/keyboardShortcuts";
 import { shouldStartPageSearch } from "./pageSearchKeyboard";
+import { loadFailedMessage } from "../../internal/connectivity";
 
 /*
  * Collapsed search affordance that widens on hover/focus or while it holds a query —
@@ -88,7 +89,7 @@ export function AlbumView({ album, playerController, libraryController }: AlbumV
         setTracks(items);
       })
       .catch(() => {
-        if (active && !showedTracks) setError("Unable to load this album.");
+        if (active && !showedTracks) setError(loadFailedMessage("Unable to load this album."));
       })
       .finally(() => {
         if (active) setIsLoading(false);
