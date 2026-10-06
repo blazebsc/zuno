@@ -1,0 +1,13 @@
+[package]
+name = "zuno-core"
+version = "0.1.0"
+edition = "2021"
+description = "Framework-free application core for the Zuno native-GUI benchmark"
+license = "Apache-2.0"
+
+[dependencies]
+# Same output stack the shipping app's `rust` audio engine uses (src-tauri/src/audio.rs):
+# cpal opens the device, rodio owns the sink. No symphonia here — the benchmark
+# synthesizes audio in-process instead of decoding downloaded Opus (see SPEC.md
+# §Audio), so the decoder feature flags are deliberately left off.
+rodio = { version = "0.22", default-features = false, features = ["playback"] }

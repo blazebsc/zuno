@@ -42,6 +42,10 @@ outputs/*
 # Crash droppings from the Git-for-Windows shell.
 *.stackdump
 
+# Rust build output for the native-GUI benchmark workspace at the repo root.
+/target
+native/**/target
+
 # Updater signing keys. `tauri signer generate -w ~/...` does not expand `~` on
 # Windows and drops a literal `~/` folder in the repo root — this makes sure a
 # private key landing here can never be committed.

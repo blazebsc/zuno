@@ -1,0 +1,14 @@
+# Native-GUI benchmark workspace.
+#
+# This workspace exists for the GUI bake-off (docs/gui-benchmarks/SPEC.md): one
+# shared, framework-free application core plus one UI crate per candidate
+# framework, each on its own `gui/<framework>` branch. Only the core is a member
+# on this baseline branch; every gui branch adds its own `native/ui-<fw>` crate
+# to `members`.
+#
+# src-tauri is excluded: it is the existing Tauri app with its own dependency
+# tree, and stays buildable exactly as before, untouched by the bake-off.
+[workspace]
+resolver = "2"
+members = ["native/core"]
+exclude = ["src-tauri", "landing", "node_modules"]
