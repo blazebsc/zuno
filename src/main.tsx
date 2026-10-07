@@ -37,6 +37,7 @@ import { DiscordRpcService } from "./player/DiscordRPC";
 import { hydratePlaybackSettings } from "./player/playbackSettings";
 import { hydratePlayHistory } from "./player/playHistory";
 import { hydrateSessionRestoreSetting } from "./ui/settings/sessionRestore";
+import { hydratePreferredLyricsSourceId } from "./internal/lyricsSourcePreference";
 import { hydrateToolbarItemSettings } from "./ui/settings/toolbarItems";
 import { hydrateHomeSectionSettings } from "./ui/settings/homeSections";
 import { applyRenderEffects, hydrateRenderEffects } from "./ui/settings/renderEffects";
@@ -86,6 +87,7 @@ void Promise.all([
   hydrateHomeSectionSettings(),
   hydratePlaybackSettings(),
   hydratePlayHistory(),
+  hydratePreferredLyricsSourceId(),
   // Read synchronously from local storage at boot, so this only backfills a machine whose
   // local storage was cleared — it takes effect from the next launch.
   hydrateSessionRestoreSetting(),

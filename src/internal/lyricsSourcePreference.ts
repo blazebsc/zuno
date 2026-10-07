@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from "react";
+import { getAppSetting, setAppSetting } from "./appSettings";
 
 /**
  * Which lyric source the listener wants tried first.
@@ -38,6 +39,14 @@ export function setPreferredLyricsSourceId(id: string): void {
     // Quota or a locked profile: the choice still applies for this session.
   }
   window.dispatchEvent(new Event(CHANGE_EVENT));
+  void setAppSetting(STORAGE_KEY, id);
+}
+
+/** Webview storage alone lost this on every restart for some Windows users (#153). */
+export async function hydratePreferredLyricsSourceId(): Promise<void> {
+  const stored = await getAppSetting<unknown>(STORAGE_KEY);
+  // No durable copy yet: backfill it from local storage.
+  setPreferredLyricsSourceId(typeof stored === "string" ? stored : getPreferredLyricsSourceId());
 }
 
 function subscribe(listener: () => void): () => void {
