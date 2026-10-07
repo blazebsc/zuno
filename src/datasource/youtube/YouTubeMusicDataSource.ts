@@ -4692,6 +4692,12 @@ export class YouTubeMusicDataSource extends DataSource {
   private async fetchSyncedLyrics(track: Track): Promise<Lyrics> {
     logInternalInfo("YouTubeMusicDataSource.getLyrics start", { trackId: track.id });
 
+    // Queue rows carry no duration, so an auto-advanced track used to skip both LRCLIB sources (#153).
+    if (!track.durationSec && track.source === "youtube") {
+      const durationSec = (await this.getTrack(track.id).catch(() => null))?.durationSec;
+      if (durationSec) track = { ...track, durationSec };
+    }
+
     const runners: Record<string, () => Promise<Lyrics | null>> = {
       "lrclib-exact": () => this.fetchLrcLibExactLyrics(track),
       betterlyrics: () => this.fetchBetterLyrics(track),
