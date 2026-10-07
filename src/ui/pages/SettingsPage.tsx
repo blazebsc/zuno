@@ -133,8 +133,10 @@ import {
   setMiniPlayerHoverAction,
   useMiniPlayerEnabled,
   useMiniPlayerHoverAction,
+  useMiniPlayerSkin,
   type MiniPlayerHoverAction,
 } from "../settings/miniPlayer";
+import { MiniPlayerSkinPicker } from "../components/mini-player/SkinPicker";
 import {
   setMainWindowGeometryPersistenceEnabled,
   useMainWindowGeometryPersistenceEnabled,
@@ -621,6 +623,7 @@ export function SettingsPage({
   const keyboardShortcuts = useKeyboardShortcuts();
   const miniPlayerEnabled = useMiniPlayerEnabled();
   const miniPlayerHoverAction = useMiniPlayerHoverAction();
+  const miniPlayerSkin = useMiniPlayerSkin();
   const sidebarMode = useSidebarMode();
   const audioEngineMode = useAudioEngineMode();
   const authenticatedStreaming = useAuthenticatedStreaming();
@@ -1887,6 +1890,14 @@ export function SettingsPage({
               onCheckedChange={setMiniPlayerEnabled}
             />
 
+            <div className="flex flex-col gap-3">
+              <span id="mini-player-skin-label" className={SETTING_LABEL}>
+                <strong>Mini player skin</strong>
+                <span>How the mini player looks. It opens in the new skin the next time it appears.</span>
+              </span>
+              <MiniPlayerSkinPicker labelledBy="mini-player-skin-label" />
+            </div>
+
             <SettingRow
               title="Library sidebar"
               description="How much room the playlist rail takes. Expand on hover keeps the collapsed width while still letting you read the list."
@@ -1911,27 +1922,29 @@ export function SettingsPage({
               )}
             </SettingRow>
 
-            <SettingRow
-              title="Mini player hover bar"
-              description="Choose what the expanded hover slider controls."
-            >
-              {() => (
-                <Select
-                  className="w-44"
-                  value={miniPlayerHoverAction}
-                  onValueChange={(value) =>
-                    setMiniPlayerHoverAction(value as MiniPlayerHoverAction)}
-                >
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="seek">Song position</SelectItem>
-                    <SelectItem value="volume">Volume</SelectItem>
-                  </SelectContent>
-                </Select>
-              )}
-            </SettingRow>
+            {miniPlayerSkin === "classic" && (
+              <SettingRow
+                title="Mini player hover bar"
+                description="Choose what the expanded hover slider controls."
+              >
+                {() => (
+                  <Select
+                    className="w-44"
+                    value={miniPlayerHoverAction}
+                    onValueChange={(value) =>
+                      setMiniPlayerHoverAction(value as MiniPlayerHoverAction)}
+                  >
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="seek">Song position</SelectItem>
+                      <SelectItem value="volume">Volume</SelectItem>
+                    </SelectContent>
+                  </Select>
+                )}
+              </SettingRow>
+            )}
 
             <div className="flex items-center justify-between gap-4 py-2">
               <span className={SETTING_LABEL}>

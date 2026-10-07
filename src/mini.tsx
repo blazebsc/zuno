@@ -5,7 +5,8 @@ import { MotionConfig } from "motion/react";
 import "./ui/styles/global.css";
 import { applyPlatformAttributes } from "./ui/platform";
 import MiniPlayer from "./ui/components/mini-player/MiniPlayer";
-import { hydrateMiniPlayerSettings } from "./ui/settings/miniPlayer";
+import { SkinnedMiniPlayer } from "./ui/components/mini-player/SkinnedMiniPlayer";
+import { hydrateMiniPlayerSettings, useMiniPlayerSkin } from "./ui/settings/miniPlayer";
 import { applyPaperPcMode, hydratePaperPcMode } from "./ui/settings/paperPcMode";
 import {
   applyRenderEffects,
@@ -34,9 +35,10 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
 /** The MotionConfig App.tsx has, for the same reason: it is what reduces the beUI springs. */
 function MiniPlayerRoot() {
   const reduce = useReduceMotion();
+  const skin = useMiniPlayerSkin();
   return (
     <MotionConfig reducedMotion={reduce ? "always" : "user"}>
-      <MiniPlayer />
+      {skin === "classic" ? <MiniPlayer /> : <SkinnedMiniPlayer skin={skin} />}
     </MotionConfig>
   );
 }

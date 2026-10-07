@@ -12,6 +12,7 @@ import {
   readLocalBooleanSetting,
   readLocalJsonSetting,
   writeLocalBooleanSetting,
+  writeLocalJsonSetting,
 } from "../../internal/durableLocalSetting";
 import { setAppSetting } from "../../internal/appSettings";
 
@@ -21,11 +22,83 @@ const POSITION_STORAGE_KEY = "mini-player-position";
 const HOVER_ACTION_STORAGE_KEY = "mini-player-hover-action";
 const CHANGE_EVENT = "mini-player-enabled-change";
 const HOVER_ACTION_CHANGE_EVENT = "mini-player-hover-action-change";
+const SKIN_STORAGE_KEY = "mini-player-skin";
+const SKIN_CHANGE_EVENT = "mini-player-skin-change";
 const MINI_PLAYER_BOTTOM_MARGIN = 24;
 const POSITION_SAVE_DELAY_MS = 350;
 let positionSaveTimer: number | null = null;
 
 export type MiniPlayerHoverAction = "seek" | "volume";
+
+/**
+ * Mini player skins. Metadata only — the components live in mini-player/skins — so the main
+ * window can open the mini window at its skin's size without loading any skin code.
+ * `width`/`height` are the window, shadow room included.
+ */
+export const MINI_PLAYER_SKINS = [
+  {
+    id: "classic",
+    name: "Classic",
+    description: "The glass capsule that opens on hover.",
+    width: 146,
+    height: 116,
+  },
+  {
+    id: "cassette",
+    name: "Cassette",
+    description: "A tape deck whose reels wind through the song.",
+    width: 272,
+    height: 180,
+  },
+  {
+    id: "vinyl",
+    name: "Vinyl",
+    description: "A spinning record with a tonearm that tracks the song.",
+    width: 216,
+    height: 216,
+  },
+  {
+    id: "y2k",
+    name: "Y2K",
+    description: "Candy-gel gloss, a chrome play orb and a backlit LCD.",
+    width: 316,
+    height: 156,
+  },
+
+] as const;
+
+export type MiniPlayerSkinId = (typeof MINI_PLAYER_SKINS)[number]["id"];
+
+function isMiniPlayerSkinId(value: unknown): value is MiniPlayerSkinId {
+  return MINI_PLAYER_SKINS.some((skin) => skin.id === value);
+}
+
+export function getMiniPlayerSkin(): MiniPlayerSkinId {
+  return readLocalJsonSetting(SKIN_STORAGE_KEY, isMiniPlayerSkinId) ?? "classic";
+}
+
+export function getMiniPlayerSkinInfo(id: MiniPlayerSkinId) {
+  return MINI_PLAYER_SKINS.find((skin) => skin.id === id) ?? MINI_PLAYER_SKINS[0];
+}
+
+export function setMiniPlayerSkin(id: MiniPlayerSkinId) {
+  writeLocalJsonSetting(SKIN_STORAGE_KEY, id);
+  window.dispatchEvent(new Event(SKIN_CHANGE_EVENT));
+}
+
+function subscribeSkin(callback: () => void) {
+  window.addEventListener(SKIN_CHANGE_EVENT, callback);
+  // The mini player is another window; this is how it hears a change made in Settings.
+  window.addEventListener("storage", callback);
+  return () => {
+    window.removeEventListener(SKIN_CHANGE_EVENT, callback);
+    window.removeEventListener("storage", callback);
+  };
+}
+
+export function useMiniPlayerSkin(): MiniPlayerSkinId {
+  return useSyncExternalStore(subscribeSkin, getMiniPlayerSkin, () => "classic");
+}
 
 export interface MiniPlayerPosition {
   x: number;
@@ -121,6 +194,7 @@ export async function hydrateMiniPlayerSettings() {
     hydrateLocalBooleanSetting(STORAGE_KEY, true, CHANGE_EVENT),
     hydrateLocalJsonSetting(POSITION_STORAGE_KEY, isMiniPlayerPosition),
     hydrateLocalJsonSetting(HOVER_ACTION_STORAGE_KEY, isMiniPlayerHoverAction),
+    hydrateLocalJsonSetting(SKIN_STORAGE_KEY, isMiniPlayerSkinId),
   ]);
 
   if (!readLocalJsonSetting(HOVER_ACTION_STORAGE_KEY, isMiniPlayerHoverAction)) {
@@ -128,6 +202,7 @@ export async function hydrateMiniPlayerSettings() {
   }
 
   window.dispatchEvent(new Event(HOVER_ACTION_CHANGE_EVENT));
+  window.dispatchEvent(new Event(SKIN_CHANGE_EVENT));
 }
 
 /*
@@ -193,11 +268,13 @@ async function createMiniPlayerWindow(): Promise<WebviewWindow | null> {
   const existing = await WebviewWindow.getByLabel(MINI_PLAYER_LABEL);
   if (existing) return existing;
 
+  // Opened at the skin's size, so it never flashes at another skin's size first.
+  const { width, height } = getMiniPlayerSkinInfo(getMiniPlayerSkin());
   return new Promise<WebviewWindow | null>((resolve) => {
     const miniWin = new WebviewWindow(MINI_PLAYER_LABEL, {
       url: "/mini.html",
-      width: 146,
-      height: 116,
+      width,
+      height,
       resizable: false,
       decorations: false,
       alwaysOnTop: true,

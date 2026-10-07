@@ -10,9 +10,8 @@ import {
   type PointerEvent,
 } from "react";
 import { cn } from "@/lib/utils";
-import { emit, listen } from "@tauri-apps/api/event";
+import { emit } from "@tauri-apps/api/event";
 import { cursorPosition, getCurrentWindow, LogicalSize, PhysicalPosition } from "@tauri-apps/api/window";
-import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { SpinnerSteps } from "@/components/motion/loader";
 import {
   ArrowUpIcon,
@@ -26,23 +25,7 @@ import { saveMiniPlayerPosition, useMiniPlayerHoverAction } from "../../settings
 import { isLinux, isMacOS, isWindows } from "../../platform";
 import { Marquee } from "@/components/motion/marquee";
 import { TrackArtwork } from "../TrackArtwork";
-
-interface PlayerSync {
-  status: string;
-  artworkUrl: string | null;
-  title: string | null;
-  artist: string | null;
-}
-
-interface TimeSync {
-  currentTime: number;
-  duration: number;
-}
-
-interface VolumeSync {
-  muted: boolean;
-  volume: number;
-}
+import { restoreMainWindow, useMiniPlayerBridge } from "./useMiniPlayerBridge";
 
 const win = getCurrentWindow();
 
@@ -97,19 +80,11 @@ const MINI_BUTTON =
   "flex size-7 shrink-0 items-center justify-center rounded-full text-neutral-300 transition-all hover:bg-white/10 hover:text-white active:scale-90 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50";
 
 export default function MiniPlayer() {
-  const [playerState, setPlayerState] = useState<PlayerSync>({
-    status: "idle",
-    artworkUrl: null,
-    title: null,
-    artist: null,
-  });
+  const { playerState, timeState, volumeState, artworkUrl } = useMiniPlayerBridge();
   const [expanded, setExpanded] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
-  const [timeState, setTimeState] = useState<TimeSync>({ currentTime: 0, duration: 0 });
-  const [volumeState, setVolumeState] = useState<VolumeSync>({ muted: false, volume: 1 });
   const [seekPreviewTime, setSeekPreviewTime] = useState<number | null>(null);
   const [volumePreview, setVolumePreview] = useState<number | null>(null);
-  const [cachedArtwork, setCachedArtwork] = useState<string | null>(null);
   const hoverAction = useMiniPlayerHoverAction();
   const expandedRef = useRef(false);
   const dragTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -296,35 +271,6 @@ export default function MiniPlayer() {
   }, []);
 
   useEffect(() => {
-    const setup = async () => {
-      const unlisten = await listen<PlayerSync>("player-state-sync", (event) => {
-        setPlayerState((previous) => {
-          if (event.payload.artworkUrl && event.payload.artworkUrl !== previous.artworkUrl) {
-            setCachedArtwork(event.payload.artworkUrl);
-          }
-
-          return event.payload;
-        });
-      });
-
-      /*
-       * Asked for only once the listener above is live.
-       *
-       * `player-state-sync` is emitted on change, not on a timer, so a window created after
-       * playback started never hears about the track already playing and sits on "Nothing
-       * playing" until the next track change. Requesting after subscribing, rather than before,
-       * is what keeps the reply from arriving before anything is listening for it.
-       */
-      void emit("mini-player:request-sync");
-
-      return unlisten;
-    };
-
-    const cleanup = setup();
-    return () => { cleanup.then((unlisten) => unlisten()); };
-  }, []);
-
-  useEffect(() => {
     return () => {
       if (dragTimerRef.current) {
         clearInterval(dragTimerRef.current);
@@ -337,19 +283,6 @@ export default function MiniPlayer() {
       }
       setIsDragging(false);
     };
-  }, []);
-
-  useEffect(() => {
-    const setup = async () => {
-      const unlisten = await listen<TimeSync>("player-time-sync", (event) => {
-        setTimeState(event.payload);
-      });
-
-      return unlisten;
-    };
-
-    const cleanup = setup();
-    return () => { cleanup.then((unlisten) => unlisten()); };
   }, []);
 
   useEffect(() => {
@@ -380,19 +313,6 @@ export default function MiniPlayer() {
       volumePreviewClearTimerRef.current = null;
     }
   }, [hoverAction]);
-
-  useEffect(() => {
-    const setup = async () => {
-      const unlisten = await listen<VolumeSync>("player-volume-sync", (event) => {
-        setVolumeState(event.payload);
-      });
-
-      return unlisten;
-    };
-
-    const cleanup = setup();
-    return () => { cleanup.then((unlisten) => unlisten()); };
-  }, []);
 
   useEffect(() => {
     const setup = async () => {
@@ -521,27 +441,7 @@ export default function MiniPlayer() {
     };
   }, []);
 
-  const handleRestore = async () => {
-    await emit("mini-player:restore-main");
-
-    /*
-     * Best-effort, and deliberately not awaited into the restore below.
-     *
-     * The main window answers that event by *destroying* this window rather than hiding it,
-     * so a hide issued here can land after the window is already gone and reject. Awaited,
-     * that rejection aborts the rest of this function and leaves the main window in the
-     * background — the click appears to do nothing. Kept only for the instant visual
-     * feedback while the destroy makes its way across.
-     */
-    void win.hide().catch(() => {});
-
-    const mainWin = await WebviewWindow.getByLabel("main");
-    if (mainWin) {
-      await mainWin.show();
-      await mainWin.unminimize();
-      await mainWin.setFocus();
-    }
-  };
+  const handleRestore = restoreMainWindow;
 
   const stopAlbumArtDrag = async (restoreIfClick: boolean) => {
     if (!macAlbumDragActiveRef.current) return;
@@ -871,7 +771,6 @@ export default function MiniPlayer() {
 
   const isPlaying = playerState.status === "playing";
   const isLoading = playerState.status === "loading";
-  const artworkUrl = playerState.artworkUrl ?? cachedArtwork;
   const displayedVolume = volumePreview ?? (volumeState.muted ? 0 : volumeState.volume);
   const displayedTime = seekPreviewTime ?? timeState.currentTime;
   const sliderValue = hoverAction === "volume" ? displayedVolume : displayedTime;
