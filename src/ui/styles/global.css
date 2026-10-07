@@ -612,3 +612,86 @@ html[data-fx-off~="marquee"] .animate-marquee-vertical {
 }
 
 .mySong { border-radius: 10px; }
+
+/*
+ * Mini player skins. Each palette is scoped to its skin's root, so a skin is a theme of its
+ * own without leaking a single colour into the app — and the app's light theme leaves them be.
+ */
+[data-mini-skin="cassette"] {
+  --skin-shell-hi: oklch(0.34 0.012 255);
+  --skin-shell: oklch(0.25 0.012 255);
+  --skin-shell-lo: oklch(0.19 0.012 255);
+  --skin-bevel-hi: oklch(1 0 0 / 14%);
+  --skin-bevel-lo: oklch(0 0 0 / 45%);
+  --skin-panel: oklch(0.16 0.01 255);
+  --skin-plate: oklch(0.14 0.01 255);
+  --skin-hole: oklch(0.08 0.005 255);
+  --skin-screw-hi: oklch(0.86 0.005 255);
+  --skin-screw: oklch(0.5 0.01 255);
+  --skin-label: oklch(0.95 0.025 88);
+  --skin-label-rule: oklch(0.55 0.08 250 / 14%);
+  --skin-label-ink: oklch(0.25 0.03 262);
+  --skin-stripe-a: oklch(0.68 0.2 32);
+  --skin-stripe-b: oklch(0.8 0.16 70);
+  --skin-stripe-c: oklch(0.72 0.12 200);
+  --skin-window: oklch(0.12 0.01 255);
+  --skin-glass: oklch(1 0 0 / 12%);
+  --skin-tape: oklch(0.27 0.04 45);
+  --skin-tape-hi: oklch(0.36 0.05 50);
+  --skin-hub: oklch(0.95 0 0);
+  --skin-key-hi: oklch(0.96 0.003 255);
+  --skin-key: oklch(0.82 0.006 255);
+  --skin-key-shade: oklch(0.52 0.01 255);
+  --skin-key-ink: oklch(0.22 0.01 255);
+  --skin-led-on: oklch(0.8 0.2 145);
+  --skin-led-busy: oklch(0.83 0.16 75);
+  --skin-led-error: oklch(0.65 0.23 27);
+  --skin-led-off: oklch(0.35 0.01 255);
+}
+
+[data-mini-skin="vinyl"] {
+  --skin-metal-a: oklch(0.78 0.005 250);
+  --skin-metal-b: oklch(0.7 0.005 250);
+  --skin-metal-glint: oklch(1 0 0 / 55%);
+  --skin-metal-edge: oklch(0.45 0.005 250);
+  --skin-record: oklch(0.12 0 0);
+  --skin-groove: oklch(0.19 0 0);
+  --skin-sheen: oklch(1 0 0 / 10%);
+  --skin-label-rim: oklch(0.95 0 0 / 70%);
+  --skin-arm-hi: oklch(0.97 0.003 250);
+  --skin-arm: oklch(0.78 0.006 250);
+  --skin-arm-lo: oklch(0.5 0.008 250);
+  --skin-stylus: oklch(0.63 0.23 27);
+  --skin-ink: oklch(0.97 0 0);
+  --skin-ink-soft: oklch(0.78 0 0);
+  --skin-hud: oklch(0.1 0 0 / 80%);
+  --skin-track: oklch(0 0 0 / 30%);
+  --skin-progress: var(--color-primary);
+  --skin-danger: oklch(0.7 0.19 27);
+  --skin-shadow: oklch(0 0 0 / 55%);
+}
+
+[data-mini-skin="y2k"] {
+  --skin-gel-top: oklch(0.8 0.12 228);
+  --skin-gel: oklch(0.62 0.17 244);
+  --skin-gel-deep: oklch(0.42 0.17 262);
+  --skin-gel-edge: oklch(0.34 0.15 264);
+  --skin-gel-glow: oklch(0.86 0.1 215 / 70%);
+  --skin-specular: oklch(1 0 0 / 82%);
+  --skin-specular-fade: oklch(1 0 0 / 10%);
+  --skin-chrome-hi: oklch(0.99 0.003 240);
+  --skin-chrome: oklch(0.82 0.012 240);
+  --skin-chrome-lo: oklch(0.52 0.02 245);
+  --skin-chrome-ink: oklch(0.3 0.08 262);
+  --skin-orb-hi: oklch(0.92 0.09 210);
+  --skin-orb: oklch(0.66 0.19 240);
+  --skin-orb-deep: oklch(0.36 0.18 264);
+  --skin-orb-glow: oklch(0.78 0.16 230 / 65%);
+  --skin-lcd-hi: oklch(0.93 0.07 175);
+  --skin-lcd: oklch(0.84 0.09 180);
+  --skin-lcd-ink: oklch(0.28 0.06 205);
+  --skin-lcd-off: oklch(0.28 0.06 205 / 13%);
+  --skin-lcd-bezel: oklch(0.3 0.08 258);
+  --skin-lcd-glare: oklch(1 0 0 / 35%);
+  --skin-danger: oklch(0.5 0.2 27);
+}
