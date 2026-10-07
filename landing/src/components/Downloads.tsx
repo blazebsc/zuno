@@ -1,28 +1,13 @@
-import { useState } from "react";
+import { useState, type KeyboardEvent } from "react";
 import { BrandIcon, OS_ICON } from "./brandIcons";
-import { CheckIcon, DownloadIcon, ShieldIcon } from "./icons";
-import { LinkButton, Mono, cn } from "./ui";
-import {
-  RELEASES_URL,
-  formatSize,
-  type LatestRelease,
-  type PlatformId,
-} from "../releases";
+import { ArrowUpRightIcon, DownloadIcon, ShieldIcon } from "./icons";
+import { CopyBlock, FOCUS_RING, LinkButton, SectionHeading, cn } from "./ui";
+import { RELEASES_URL, formatSize, timeAgo, type LatestRelease, type PlatformId } from "../releases";
 
-/**
- * One tile per operating system, each with its own format choice.
- *
- * A flat list of every asset makes the reader do the matching: four `.dmg`-ish names, two of
- * which are wrong for their machine. Grouping by OS and putting the variants behind a small
- * segmented control means there is exactly one decision per tile, and it is one the reader can
- * actually answer — "Apple Silicon or Intel" is a question about their laptop, not about a
- * filename.
- */
 interface Variant {
   label: string;
-  /** Which resolved platform build this maps to. */
   platform: PlatformId;
-  /** Narrows further within a platform's assets — Linux ships two formats under one id. */
+  /** Narrows within a platform's assets: Linux ships three formats under one id. */
   match?: RegExp;
   note?: string;
 }
@@ -30,18 +15,17 @@ interface Variant {
 interface OsTile {
   id: "windows" | "macos" | "linux";
   name: string;
-  icon: string;
-  /** Which detected platforms should light this tile up. */
   detects: readonly PlatformId[];
   requirement: string;
   variants: readonly Variant[];
 }
 
+const MAC_NOTE = "Unsigned: right-click → Open the first time.";
+
 const TILES: readonly OsTile[] = [
   {
     id: "windows",
     name: "Windows",
-    icon: OS_ICON.windows,
     detects: ["windows"],
     requirement: "Windows 10 and 11 · 64-bit",
     variants: [
@@ -52,188 +36,152 @@ const TILES: readonly OsTile[] = [
   {
     id: "macos",
     name: "macOS",
-    icon: OS_ICON.macos,
     detects: ["macos-arm", "macos-intel"],
     requirement: "macOS 12 and later",
     variants: [
-      {
-        label: "Apple Silicon",
-        platform: "macos-arm",
-        note: "unsigned — right-click → Open on first launch",
-      },
-      {
-        label: "Intel",
-        platform: "macos-intel",
-        note: "unsigned — right-click → Open on first launch",
-      },
+      { label: "Apple Silicon", platform: "macos-arm", note: MAC_NOTE },
+      { label: "Intel", platform: "macos-intel", note: MAC_NOTE },
     ],
   },
   {
     id: "linux",
     name: "Linux",
-    icon: OS_ICON.linux,
     detects: ["linux"],
     requirement: "x86_64 · glibc 2.31+",
     variants: [
-      { label: "AppImage", platform: "linux", match: /\.AppImage$/i, note: "needs chmod +x" },
-      { label: ".deb", platform: "linux", match: /\.deb$/i, note: "apt-based distributions" },
-      { label: ".rpm", platform: "linux", match: /\.rpm$/i, note: "fedora and opensuse" },
+      { label: "AppImage", platform: "linux", match: /\.AppImage$/i, note: "chmod +x, then run it." },
+      { label: ".deb", platform: "linux", match: /\.deb$/i, note: "Debian, Ubuntu, Mint." },
+      { label: ".rpm", platform: "linux", match: /\.rpm$/i, note: "Fedora, openSUSE." },
     ],
   },
 ];
 
-function Tile({
-  tile,
-  release,
-  detected,
-}: {
-  tile: OsTile;
-  release: LatestRelease | null;
-  detected: PlatformId | null;
-}) {
+function Tile({ tile, release, detected }: { tile: OsTile; release: LatestRelease | null; detected: PlatformId | null }) {
   const isYours = detected !== null && tile.detects.includes(detected);
-  /* Open on the variant that matches the reader's machine, not always the first. */
-  const [variantIndex, setVariantIndex] = useState(() => {
-    const index = tile.variants.findIndex((variant) => variant.platform === detected);
-    return index >= 0 ? index : 0;
-  });
-
+  const [variantIndex, setVariantIndex] = useState(() => Math.max(0, tile.variants.findIndex((variant) => variant.platform === detected)));
   const variant = tile.variants[variantIndex];
   const build = release?.downloads[variant.platform];
-  /*
-   * Linux ships two formats behind one platform id, so the resolved asset may be the AppImage
-   * when the reader asked for the .deb. Rather than link the wrong file, the variant falls back
-   * to the releases page — a correct extra click beats a confident wrong download.
-   */
+  // Linux resolves one asset per id; if it is not the chosen format, the releases page beats a wrong file.
   const asset = build && (!variant.match || variant.match.test(build.name)) ? build : undefined;
+
+  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    const delta = event.key === "ArrowRight" || event.key === "ArrowDown" ? 1 : event.key === "ArrowLeft" || event.key === "ArrowUp" ? -1 : 0;
+    if (delta === 0) return;
+    event.preventDefault();
+    const next = (variantIndex + delta + tile.variants.length) % tile.variants.length;
+    setVariantIndex(next);
+    event.currentTarget.querySelectorAll<HTMLButtonElement>("[role=radio]")[next]?.focus();
+  };
 
   return (
     <article
       className={cn(
-        "group relative flex flex-col gap-5 rounded-2xl p-6 ring-1 transition-colors",
-        isYours ? "bg-card/70 ring-primary/30" : "bg-card/30 ring-border hover:bg-card/50",
+        "spotlight reveal relative flex flex-col gap-6 overflow-hidden rounded-3xl p-6 sm:p-7",
+        isYours ? "bg-card/70" : "bg-card/35",
       )}
     >
+      {isYours ? (
+        <span
+          className="pointer-events-none absolute -top-24 left-1/2 h-48 w-3/4 -translate-x-1/2 rounded-full bg-primary/25 blur-3xl"
+          aria-hidden="true"
+        />
+      ) : null}
+
       <div className="flex items-start justify-between gap-3">
-        <BrandIcon icon={tile.icon} width={34} height={34} className="text-foreground" />
+        <BrandIcon icon={OS_ICON[tile.id]} width={36} height={36} className="text-foreground" />
         {isYours ? (
-          <span className="rounded-full bg-primary/10 px-2 py-0.5 font-mono text-[11px] uppercase tracking-wider text-primary">
-            your system
-          </span>
+          <span className="rounded-full bg-primary/15 px-2.5 py-1 font-mono text-[11px] uppercase tracking-wider text-primary">your system</span>
         ) : null}
       </div>
 
       <div className="flex flex-col gap-1">
-        <h3 className="text-xl font-semibold text-foreground">{tile.name}</h3>
-        <Mono>{tile.requirement}</Mono>
+        <h3 className="text-2xl font-semibold tracking-[-0.03em]">{tile.name}</h3>
+        <span className="font-mono text-[12px] text-muted-foreground">{tile.requirement}</span>
       </div>
 
-      {tile.variants.length > 1 ? (
-        <div
-          className="flex items-center gap-0.5 rounded-full bg-background/60 p-0.5 ring-1 ring-border"
-          role="tablist"
-          aria-label={`${tile.name} format`}
-        >
-          {tile.variants.map((option, index) => (
-            <button
-              key={option.label}
-              type="button"
-              role="tab"
-              aria-selected={index === variantIndex}
-              onClick={() => setVariantIndex(index)}
-              className={cn(
-                "flex-1 rounded-full px-3 py-2 font-mono text-[13px] transition-colors",
-                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
-                index === variantIndex
-                  ? "bg-card text-foreground"
-                  : "text-muted-foreground hover:text-foreground",
-              )}
-            >
-              {option.label}
-            </button>
-          ))}
-        </div>
-      ) : null}
+      <div className="flex gap-1 rounded-full bg-background/70 p-1" role="radiogroup" aria-label={`${tile.name} format`} onKeyDown={onKeyDown}>
+        {tile.variants.map((option, index) => (
+          <button
+            key={option.label}
+            type="button"
+            role="radio"
+            aria-checked={index === variantIndex}
+            tabIndex={index === variantIndex ? 0 : -1}
+            onClick={() => setVariantIndex(index)}
+            className={cn(
+              "flex-1 rounded-full px-2 py-2 font-mono text-[12px] transition-colors",
+              FOCUS_RING,
+              "focus-visible:ring-inset",
+              index === variantIndex ? "bg-card text-foreground" : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            {option.label}
+          </button>
+        ))}
+      </div>
 
       <div className="mt-auto flex flex-col gap-3">
-        <LinkButton
-          href={asset?.url ?? RELEASES_URL}
-          rel="noopener"
-          variant={isYours ? "solid" : "muted"}
-          className="w-full"
-        >
+        <LinkButton href={asset?.url ?? RELEASES_URL} rel="noopener" variant={isYours ? "solid" : "ghost"} className="w-full">
           <DownloadIcon size={18} />
           Download
         </LinkButton>
-
-        <div className="flex min-h-8 flex-col gap-0.5">
-          <Mono className="truncate">
+        <div className="flex min-h-10 flex-col gap-0.5">
+          <span className="truncate font-mono text-[12px] text-muted-foreground">
             {asset ? `${asset.name} · ${formatSize(asset.size)}` : "see all releases"}
-          </Mono>
-          {variant.note ? (
-            <span className="text-[13px] leading-relaxed text-muted-foreground/70">
-              {variant.note}
-            </span>
-          ) : null}
+          </span>
+          {variant.note ? <span className="text-[13px] text-muted-foreground/75">{variant.note}</span> : null}
         </div>
       </div>
     </article>
   );
 }
 
-const ASSURANCES: readonly string[] = [
-  "No telemetry — no analytics, crash reporting or usage pings",
-  "Your own Google sign-in — Zuno has no account to create",
-  "Apache 2.0, built from the public tree by CI",
-];
-
-export function Downloads({
-  release,
-  platform,
-}: {
-  release: LatestRelease | null;
-  platform: PlatformId | null;
-}) {
+export function Downloads({ release, platform }: { release: LatestRelease | null; platform: PlatformId | null }) {
   return (
-    <div className="flex flex-col gap-6">
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-        <span className="flex items-baseline gap-2">
-          <span className="text-lg font-semibold text-foreground">
-            {release ? `v${release.version}` : "Latest release"}
+    <section id="download">
+      <div className="mx-auto max-w-6xl px-6 py-20 lg:py-28">
+        <SectionHeading
+          index="03"
+          label="download"
+          title="Get Zuno."
+          lede="Updates install themselves."
+        />
+
+        <div className="mt-6 flex flex-wrap items-center gap-x-4 gap-y-2 font-mono text-[12px] text-muted-foreground">
+          <span className="text-foreground">{release ? `v${release.version}` : "latest"}</span>
+          {release ? <span>released {timeAgo(release.publishedAt)}</span> : null}
+          <span className="flex items-center gap-1.5 text-primary">
+            <ShieldIcon size={14} />
+            signed updates
           </span>
-          <Mono>· updates install themselves after the first run</Mono>
-        </span>
-        <span className="ml-auto flex items-center gap-1.5 rounded-full bg-primary/10 px-2.5 py-1 text-primary">
-          <ShieldIcon size={13} />
-          <span className="font-mono text-[13px]">signed</span>
-        </span>
-      </div>
+        </div>
 
-      <div className="grid gap-4 md:grid-cols-3">
-        {TILES.map((tile) => (
-          <Tile key={tile.id} tile={tile} release={release} detected={platform} />
-        ))}
-      </div>
+        <div className="mt-12 grid grid-cols-1 gap-4 md:grid-cols-3">
+          {TILES.map((tile) => (
+            <Tile key={tile.id} tile={tile} release={release} detected={platform} />
+          ))}
+        </div>
 
-      <div className="flex flex-col gap-3 rounded-2xl bg-card/30 p-6 ring-1 ring-border">
-        {ASSURANCES.map((line) => (
-          <div key={line} className="flex items-start gap-3">
-            <span
-              className="mt-0.5 grid size-5 shrink-0 place-items-center rounded-full bg-primary/10 text-primary"
-              aria-hidden="true"
-            >
-              <CheckIcon size={12} />
-            </span>
-            <span className="text-base text-muted-foreground">{line}</span>
+        <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-[1fr_auto]">
+          <div className="flex flex-col gap-3 rounded-3xl bg-card/35 p-5 sm:flex-row sm:items-center sm:gap-5">
+            <span className="shrink-0 pl-1 text-[15px] font-medium">On Arch?</span>
+            <div className="min-w-0 flex-1">
+              <CopyBlock label="the AUR install command" lines={["yay -S zuno"]} />
+            </div>
           </div>
-        ))}
-        <p className="mt-1">
-          <Mono>
-            no subscription · no upsell · no bundled software · no ad blocking or DRM
-            circumvention — it plays what your account can already play
-          </Mono>
-        </p>
+          <a
+            href={RELEASES_URL}
+            rel="noopener"
+            className={cn(
+              "flex items-center justify-between gap-6 rounded-3xl bg-card/35 px-6 py-5 text-[15px] font-medium transition-colors hover:bg-card/60",
+              FOCUS_RING,
+            )}
+          >
+            All releases & changelogs
+            <ArrowUpRightIcon size={18} className="text-muted-foreground" />
+          </a>
+        </div>
       </div>
-    </div>
+    </section>
   );
 }

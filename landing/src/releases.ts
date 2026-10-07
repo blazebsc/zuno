@@ -146,3 +146,14 @@ export function formatSize(bytes: number): string {
   const megabytes = bytes / 1024 / 1024;
   return `${megabytes.toFixed(1)} MB`;
 }
+
+/** "3 days ago", "last week" — or "recently" when GitHub gave no date. */
+export function timeAgo(iso: string | null, now = Date.now()): string {
+  const then = iso ? Date.parse(iso) : Number.NaN;
+  if (!Number.isFinite(then)) return "recently";
+  const days = Math.round((then - now) / 86_400_000);
+  const format = new Intl.RelativeTimeFormat("en", { numeric: "auto" });
+  if (Math.abs(days) < 7) return format.format(days, "day");
+  if (Math.abs(days) < 60) return format.format(Math.round(days / 7), "week");
+  return format.format(Math.round(days / 30), "month");
+}

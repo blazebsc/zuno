@@ -1,148 +1,103 @@
-import type { AnchorHTMLAttributes, ReactNode } from "react";
+import { useState, type AnchorHTMLAttributes, type ReactNode } from "react";
+import { CheckIcon, CopyIcon } from "./icons";
 
-/**
- * Class merger.
- *
- * The app uses clsx + tailwind-merge, which exist there because components take a `className`
- * override and have to resolve conflicts. Nothing on this page does, so a join is the whole
- * requirement — two dependencies for a filter would not earn their place.
- */
+/** A plain join: nothing here overrides classes, so tailwind-merge would not earn its bytes. */
 export function cn(...classes: Array<string | false | null | undefined>): string {
   return classes.filter(Boolean).join(" ");
 }
 
-/**
- * Geometry, type and behaviour shared by every weight — only colour differs, so only colour
- * lives in the variants.
- *
- * Nothing glows and nothing floats. A tinted shadow spilling out from under a saturated pill,
- * a `brightness` filter on hover, an inset top highlight faking a lit edge — those are the
- * default settings of a button that nobody decided anything about. The press is the whole
- * interaction: colour shifts on hover, and the pill moves a single pixel *down* when it is
- * actually clicked, because that is the direction a pressed thing goes.
- *
- * `group` is in the base because the buttons carry icons that react to the button's own hover,
- * and a variant that forgot it would silently kill the nudge.
- */
+export const FOCUS_RING = "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
+
 const BASE =
   "group inline-flex shrink-0 select-none items-center justify-center gap-2 rounded-full font-semibold tracking-[-0.01em] " +
-  "transition-[background-color,border-color,color,transform] duration-150 ease-out " +
-  "active:translate-y-px " +
-  /* Offset colour set once here: Tailwind defaults it to white, which on this page draws a white
-     gap around every focused button. `background` is right for the hero and the sections both. */
-  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-background";
+  "transition-[background-color,color,transform] duration-150 ease-out active:translate-y-px " +
+  FOCUS_RING;
 
-/**
- * Size is a prop, not a `className` override.
- *
- * `cn` is a plain join, so a caller passing `px-7` did not replace the variant's `px-5` — both
- * landed on the element and Tailwind's stylesheet order picked the winner. That resolves the way
- * you want today only because `px-7` happens to be emitted after `px-5`. Naming the three sizes
- * that actually exist means padding is set once, by whoever knows which one they want.
- */
 const SIZES = {
-  sm: "px-4 py-2 text-sm",
-  md: "px-5 py-2.5 text-base",
-  /* Wide rather than tall: the label is the shape, so the horizontal padding carries the weight
-     and the type stays at reading size instead of growing with the button. */
-  lg: "px-8 py-4 text-base",
+  sm: "h-9 px-4 text-sm",
+  md: "h-11 px-5 text-[15px]",
+  lg: "h-13 px-7 text-[15px]",
 } as const;
 
-export type ButtonSize = keyof typeof SIZES;
-
-/*
- * The primary action, matching the app's primary button — same accent fill, same hover step.
- *
- * The download buttons are the one place the page and the product are the same object, so they
- * wear the product's colour rather than the page's neutral.
- */
-const SOLID = "bg-primary text-primary-foreground hover:bg-primary/90 focus-visible:ring-primary";
-
-/*
- * The secondary weight, for actions sitting on top of the video.
- *
- * Nothing opaque works there — a card fill punches a hole in the footage — and nothing fully
- * transparent works either, because the label would compete with whatever frame happens to be
- * underneath. A hairline over blur is the least that stays legible over moving colour.
- */
-const OUTLINE =
-  "border border-white/15 bg-white/[0.06] text-white backdrop-blur-xl " +
-  "hover:border-white/25 hover:bg-white/[0.12] focus-visible:ring-white";
-
-/* Same weight, on an opaque surface — the blurred variant needs something behind it to blur. */
-const MUTED =
-  "border border-border text-foreground hover:border-white/20 hover:bg-white/[0.05] " +
-  "focus-visible:ring-ring";
-
-/*
- * Borders, not rings, on the two bordered weights.
- *
- * `ring-1 ring-border` plus `focus-visible:ring-2 focus-visible:ring-ring` is two rules fighting
- * over one property, settled by whichever variant Tailwind emitted last. Using `border` for the
- * resting outline leaves the ring to mean exactly one thing: focus.
- */
-const VARIANTS = { solid: SOLID, outline: OUTLINE, muted: MUTED } as const;
-export type ButtonVariant = keyof typeof VARIANTS;
+const VARIANTS = {
+  solid: "bg-primary text-primary-foreground hover:bg-primary/88",
+  light: "bg-foreground text-background hover:bg-foreground/88",
+  ghost: "bg-card/50 text-foreground hover:bg-card",
+} as const;
 
 export function LinkButton({
   variant = "solid",
   size = "md",
   className,
   ...props
-}: AnchorHTMLAttributes<HTMLAnchorElement> & {
-  variant?: ButtonVariant;
-  size?: ButtonSize;
-}) {
+}: AnchorHTMLAttributes<HTMLAnchorElement> & { variant?: keyof typeof VARIANTS; size?: keyof typeof SIZES }) {
   return <a className={cn(BASE, SIZES[size], VARIANTS[variant], className)} {...props} />;
 }
 
-/** Small monospace label. Used for versions, sizes, counts — anything machine-ish. */
-export function Mono({ className, children }: { className?: string; children: ReactNode }) {
+export function SectionHeading({
+  index,
+  label,
+  title,
+  lede,
+}: {
+  index: string;
+  label: string;
+  title: ReactNode;
+  lede?: ReactNode;
+}) {
   return (
-    <span className={cn("font-mono text-[13px] tracking-tight text-muted-foreground", className)}>
-      {children}
-    </span>
+    <div className="flex flex-col gap-5">
+      <p className="flex items-center gap-3 font-mono text-[12px] uppercase tracking-[0.16em] text-muted-foreground">
+        <span className="text-primary">{index}</span>
+        <span className="h-px w-8 bg-muted-foreground/40" aria-hidden="true" />
+        {label}
+      </p>
+      <h2 className="max-w-[20ch] text-balance text-[clamp(2.25rem,4.6vw,4rem)] font-semibold leading-[1.02] tracking-[-0.042em]">
+        {title}
+      </h2>
+      {lede ? <p className="max-w-[46ch] text-pretty text-lg leading-relaxed text-muted-foreground">{lede}</p> : null}
+    </div>
   );
 }
 
-/**
- * Section shell.
- *
- * Everything is on one measure and left-aligned. Centred columns read as a template; a single
- * consistent left edge running the length of the page is what makes it read as designed.
- */
-export function Section({
-  id,
-  index,
-  title,
-  lede,
-  children,
-}: {
-  id?: string;
-  /** Two-digit marker in the margin — the page reads as a numbered document. */
-  index?: string;
-  title?: string;
-  lede?: ReactNode;
-  children?: ReactNode;
-}) {
+/** Shell commands with one copy button; still selectable by hand where the clipboard is blocked. */
+export function CopyBlock({ lines, label }: { lines: readonly string[]; label: string }) {
+  const [copied, setCopied] = useState(false);
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(lines.join("\n"));
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1600);
+    } catch {
+      // Blocked clipboard: the text is still there to select.
+    }
+  };
+
   return (
-    <section id={id} className="reveal">
-      <div className="mx-auto w-full max-w-6xl px-6 py-20 sm:py-28">
-        <div className="flex flex-col gap-4 sm:flex-row sm:gap-10">
-          <Mono className="shrink-0 pt-1.5 sm:w-16">{index}</Mono>
-          <div className="flex min-w-0 flex-1 flex-col gap-4">
-            <h2 className="max-w-2xl text-pretty text-3xl font-semibold tracking-[-0.025em] text-foreground sm:text-4xl">
-              {title}
-            </h2>
-            {lede ? (
-              <p className="max-w-2xl text-pretty text-base leading-relaxed text-muted-foreground sm:text-lg">
-                {lede}
-              </p>
-            ) : null}
-            {children ? <div className="mt-6">{children}</div> : null}
-          </div>
-        </div>
-      </div>
-    </section>
+    <div className="flex items-start gap-3 rounded-2xl bg-background/70 py-3 pl-4 pr-2">
+      <pre className="min-w-0 flex-1 overflow-x-auto py-1 font-mono text-[13px] leading-6">
+        {lines.map((line) => (
+          <span key={line} className="block whitespace-pre">
+            <span className="select-none text-primary">$ </span>
+            {line}
+          </span>
+        ))}
+      </pre>
+      <button
+        type="button"
+        onClick={copy}
+        className={cn(
+          "grid size-9 shrink-0 place-items-center rounded-xl text-muted-foreground transition-colors hover:bg-card hover:text-foreground",
+          FOCUS_RING,
+        )}
+        aria-label={`Copy ${label}`}
+      >
+        {copied ? <CheckIcon size={16} /> : <CopyIcon size={16} />}
+      </button>
+      <span className="sr-only" role="status" aria-live="polite">
+        {copied ? "Copied to clipboard" : ""}
+      </span>
+    </div>
   );
 }

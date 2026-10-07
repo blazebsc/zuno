@@ -1,14 +1,6 @@
 @import "tailwindcss";
 
-/*
- * The app's token layer, copied rather than imported.
- *
- * `src/ui/styles/global.css` is full of things a website has no use for — window rounding,
- * titlebar heights, Paper-PC overrides, scrollbar hiding — and importing across project
- * boundaries would make the site's build depend on the desktop app's stylesheet staying
- * website-safe. These are the colour tokens only, byte-identical to the app's, so the two
- * genuinely match. If the brand shifts, both change together by hand.
- */
+/* The app's colour tokens, copied byte-for-byte; the brand block below is site-only. */
 @theme {
   --color-background: oklch(0.145 0 0);
   --color-foreground: oklch(0.985 0 0);
@@ -21,7 +13,6 @@
   --color-muted: oklch(0.269 0 0);
   --color-muted-foreground: oklch(0.708 0 0);
 
-  /* Brand accent — the one colour carried over from the old identity. */
   --color-primary: #ff0033;
   --color-primary-foreground: oklch(0.985 0 0);
 
@@ -35,8 +26,24 @@
   --color-input: oklch(1 0 0 / 15%);
   --color-ring: #ff0033;
 
-  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
+  /* The mascot's palette and the record on the hero deck. */
+  --color-ghost: oklch(0.985 0.012 95);
+  --color-headphone: oklch(0.76 0.135 50);
+  --color-vinyl: oklch(0.2 0 0);
+  --color-groove: oklch(0.13 0 0);
+  --color-shadow: oklch(0 0 0);
+
+  /* Third-party marks, in their own brand values. */
+  --color-discord: #5865f2;
+  --color-lastfm: #d51007;
+
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial,
+    sans-serif;
+  --font-mono: "Geist Mono Variable", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
     monospace;
+
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-spring: cubic-bezier(0.34, 1.45, 0.64, 1);
 }
 
 html[data-theme="light"] {
@@ -64,105 +71,129 @@ html[data-theme="dark"] {
   color-scheme: dark;
 }
 
-html,
-body,
-#root {
-  min-height: 100%;
-  background: var(--color-background);
-  color: var(--color-foreground);
-  font-family: "Inter Variable", ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto,
-    Arial, "Apple Color Emoji", "Segoe UI Emoji";
-  /* Same numeral treatment as the app, so version strings and sizes do not jitter. */
-  font-feature-settings: "cv11", "tnum";
+/* Written every frame by the demo player (src/audio/demoPlayer.ts); registered so calc() sees numbers. */
+@property --bass {
+  syntax: "<number>";
+  inherits: true;
+  initial-value: 0;
 }
 
-/* The accent earns its keep in the small places too. */
-::selection {
-  background: color-mix(in oklch, var(--color-primary) 28%, transparent);
-  color: var(--color-foreground);
+@property --level {
+  syntax: "<number>";
+  inherits: true;
+  initial-value: 0;
 }
 
-/* Anchors land below the sticky header rather than under it. */
+@property --progress {
+  syntax: "<number>";
+  inherits: true;
+  initial-value: 0;
+}
+
 html {
+  background: var(--color-background);
   scroll-behavior: smooth;
   scroll-padding-top: 6rem;
 }
 
-/*
- * Sections reveal as they arrive.
- *
- * `animation-timeline: view()` does this with no observer, no state and no JS — the browser
- * drives it off scroll position. Unsupported engines simply see the finished state, because
- * the rule only applies where the timeline resolves.
- */
-@supports (animation-timeline: view()) {
-  @media (prefers-reduced-motion: no-preference) {
-    .reveal {
-      animation: reveal-in linear both;
-      animation-timeline: view();
-      animation-range: entry 0% cover 22%;
-    }
-  }
+body {
+  min-height: 100svh;
+  background: var(--color-background);
+  color: var(--color-foreground);
+  font-family: var(--font-sans);
+  font-feature-settings: "cv11";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow-x: clip;
 }
 
-/*
- * Film grain over the hero.
- *
- * A single tiling `feTurbulence` as a data URI — no image request, no canvas, no library. It is
- * what stops a large dark surface from banding, and what stops the whole thing from reading as
- * a stock gradient. Kept faint enough to be felt rather than seen.
- */
+::selection {
+  background: color-mix(in oklch, var(--color-primary) 32%, transparent);
+  color: var(--color-foreground);
+}
+
+/* ── Texture ─────────────────────────────────────────────────────────── */
+
+/* Faint film grain: stops large dark fields banding. */
 .grain::after {
   content: "";
   position: absolute;
   inset: 0;
+  z-index: 1;
   pointer-events: none;
-  opacity: 0.055;
+  opacity: 0.05;
+  -webkit-mask-image: linear-gradient(transparent, #000 18%, #000 82%, transparent);
+  mask-image: linear-gradient(transparent, #000 18%, #000 82%, transparent);
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)'/%3E%3C/svg%3E");
 }
 
-/*
- * The hero's entrance cascade.
- *
- * Shares `reveal-in` with the scroll-revealed sections, so the page has one arrival motion rather
- * than two. Time-based here rather than scroll-driven, because the hero is already on screen when
- * the page loads and has no entry to animate.
- */
-.hero-in {
-  animation: reveal-in 0.8s cubic-bezier(0.16, 1, 0.3, 1) both;
+/* ── Header ──────────────────────────────────────────────────────────── */
+
+.header-glass {
+  background-color: color-mix(in oklch, var(--color-background) 72%, transparent);
+  backdrop-filter: blur(18px) saturate(1.4);
+  box-shadow: 0 12px 40px -16px color-mix(in oklch, var(--color-shadow) 80%, transparent);
 }
 
-/*
- * The moon, as an arc across the top.
- *
- * A circle far wider than the viewport, pushed up until only the bottom of its limb is in frame.
- * Nothing sits behind the type — the light arrives from above it and falls away, which is the
- * whole difference between a light source and a blurred blob parked behind a headline.
- *
- * The border is what draws the arc: on a `border-radius: 50%` box it follows the curve for free,
- * and because the top of the circle is out of frame only the bottom of the ring ever shows. The
- * outer shadow is the spill below it. The mask then fades both towards the ends, so the arc has
- * no visible termination — it simply stops being bright.
- */
-.moon-arc {
-  border: 1px solid oklch(1 0 0 / 0.14);
-  box-shadow:
-    0 0 90px 6px color-mix(in oklch, var(--color-primary) 20%, transparent),
-    0 0 36px 0 oklch(1 0 0 / 0.05);
-  /* Prefixed as well as standard: Safari shipped `-webkit-mask-image`, and a dropped mask here
-     would leave a hard-edged 1px circle drawn across the top of the page. */
-  -webkit-mask-image: radial-gradient(38% 34% at 50% 100%, #5e0606 0%, transparent 74%);
-  mask-image: radial-gradient(38% 34% at 50% 100%, #000 0%, transparent 74%);
+/* Clear over the hero, glass once there is content behind it: driven by scroll, no listener. */
+@supports (animation-timeline: scroll()) {
+  .header-glass {
+    animation: header-glass linear both;
+    animation-timeline: scroll(root block);
+    animation-range: 0 160px;
+  }
 }
 
-/*
- * Decorations that get out of the way once you start reading.
- *
- * `scroll(root block)` is the document's own scroll position rather than the element's view
- * progress — which is what "fade as the page moves" actually means, and it does not care where
- * in the hero the element happens to sit. Lengths rather than percentages in the range, because
- * the interesting distance is the first screen of scrolling, not a fraction of the page.
- */
+@keyframes header-glass {
+  from {
+    background-color: transparent;
+    backdrop-filter: blur(0) saturate(1);
+    box-shadow: none;
+  }
+}
+
+html:not([data-playing="true"]) .now-bars {
+  display: none;
+}
+
+/* ── Hero ────────────────────────────────────────────────────────────── */
+
+.hero-aurora {
+  position: absolute;
+  inset: -20% -10% auto;
+  height: 120%;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(42% 38% at 78% 42%, color-mix(in oklch, var(--color-primary) 22%, transparent), transparent 70%),
+    radial-gradient(30% 30% at 64% 70%, color-mix(in oklch, var(--color-headphone) 12%, transparent), transparent 70%),
+    radial-gradient(40% 30% at 12% 8%, color-mix(in oklch, var(--color-foreground) 5%, transparent), transparent 70%);
+  opacity: calc(0.7 + var(--level) * 0.6);
+}
+
+.rise {
+  animation: rise 1.1s var(--ease-out-expo) both;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(0.4em);
+    filter: blur(8px);
+  }
+}
+
+.caret {
+  animation: caret-blink 1.2s steps(1) infinite;
+}
+
+@keyframes caret-blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+/* Fades out over the first screen of scrolling, driven by the page scroll itself. */
 @supports (animation-timeline: scroll()) {
   @media (prefers-reduced-motion: no-preference) {
     .scroll-fade {
@@ -174,63 +205,239 @@ html {
 }
 
 @keyframes fade-away {
-  from {
-    opacity: 1;
-  }
   to {
     opacity: 0;
   }
 }
 
-/*
- * The floating badges.
- *
- * Rotation is carried in `--tilt` rather than in a class, because a `transform` inside keyframes
- * replaces the whole property — a `rotate-3` utility beside this would simply be overwritten the
- * moment the animation started. Each badge sets its own tilt, duration and a negative delay, so
- * they start out of phase instead of bobbing in unison.
- */
-.float {
-  animation: float-y 7s ease-in-out infinite alternate;
+/* ── Deck: record, tonearm, spectrum ─────────────────────────────────── */
+
+.deck {
+  position: relative;
+  aspect-ratio: 1;
+  width: 100%;
 }
 
-@keyframes float-y {
-  from {
-    transform: translateY(-0.4rem) rotate(var(--tilt, 0deg));
-  }
-  to {
-    transform: translateY(0.4rem) rotate(var(--tilt, 0deg));
-  }
+.deck-glow {
+  position: absolute;
+  inset: 6%;
+  border-radius: 50%;
+  pointer-events: none;
+  background: radial-gradient(
+    closest-side,
+    color-mix(in oklch, var(--color-primary) 75%, transparent),
+    color-mix(in oklch, var(--color-headphone) 30%, transparent) 55%,
+    transparent 75%
+  );
+  filter: blur(56px);
+  opacity: calc(0.16 + var(--level) * 0.6);
+  scale: calc(0.94 + var(--bass) * 0.2);
+  will-change: opacity, scale;
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .float {
-    animation: none;
-    transform: rotate(var(--tilt, 0deg));
-  }
+.spectrum {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
 }
 
-/*
- * The film stage.
- *
- * Taller than the viewport, with a `position: sticky` child that pins for a screen's worth of
- * scrolling. Inside it the frame grows from a rounded card to a full-bleed one — so the demo
- * takes the whole screen without the page ever handing it a separate route or a lightbox.
- *
- * `animation-timeline: view()` drives the growth off the stage's own position, which means no
- * scroll listener, no rAF loop and no state — the same trick the sections already use to reveal.
- * Where it is unsupported the frame renders at its finished size and simply sits there, which is
- * also exactly what the narrow layout does on purpose.
- */
+.record {
+  position: absolute;
+  inset: 8%;
+  border-radius: 50%;
+  background: var(--color-groove);
+  box-shadow:
+    0 40px 80px -30px var(--color-shadow),
+    inset 0 0 0 1px color-mix(in oklch, var(--color-foreground) 6%, transparent);
+  cursor: pointer;
+  scale: calc(1 + var(--bass) * 0.012);
+}
+
+/* The light stays put while the grooves turn, which is what makes the spin read as real. */
+.record::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  pointer-events: none;
+  background: conic-gradient(
+    from 200deg,
+    transparent 0 6%,
+    color-mix(in oklch, var(--color-foreground) 9%, transparent) 13%,
+    transparent 21% 49%,
+    color-mix(in oklch, var(--color-foreground) 6%, transparent) 61%,
+    transparent 70%
+  );
+}
+
+.record-spin {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+}
+
+.record-grooves {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle, transparent 0 36%, var(--color-groove) 36% 37.2%, transparent 37.2% 57%,
+      var(--color-groove) 57% 58.2%, transparent 58.2% 78%, var(--color-groove) 78% 79.2%, transparent 79.2%),
+    repeating-radial-gradient(circle, var(--color-vinyl) 0 1px, var(--color-groove) 1px 3px);
+}
+
+.record-text {
+  position: absolute;
+  inset: 0;
+  font-family: var(--font-mono);
+  font-size: 3px;
+  letter-spacing: 0.6px;
+  fill: color-mix(in oklch, var(--color-foreground) 34%, transparent);
+}
+
+.record-label {
+  position: absolute;
+  inset: 33%;
+  container-type: size;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  row-gap: 15%;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, color-mix(in oklch, var(--color-primary) 80%, var(--color-foreground)), var(--color-primary) 60%);
+  color: var(--color-primary-foreground);
+}
+
+.spindle {
+  position: absolute;
+  inset: 47%;
+  border-radius: 50%;
+  background: var(--color-groove);
+}
+
+.arm-base {
+  fill: var(--color-card);
+}
+
+.arm-pivot {
+  fill: var(--color-muted-foreground);
+}
+
+.arm-weight {
+  stroke: var(--color-muted-foreground);
+  stroke-width: 4.5;
+  stroke-linecap: round;
+}
+
+.arm-rod {
+  stroke: var(--color-ghost);
+  stroke-width: 1.3;
+  stroke-linecap: round;
+}
+
+.arm-head {
+  stroke: var(--color-headphone);
+  stroke-width: 3.4;
+  stroke-linecap: round;
+}
+
+/* Off the record at rest; on it while playing, creeping inward as the song runs, like a real one. */
+.tonearm {
+  transform-box: view-box;
+  transform-origin: 88px 14px;
+  rotate: -25deg;
+  transition: rotate 1.2s var(--ease-spring);
+}
+
+html[data-playing="true"] .tonearm {
+  rotate: calc(var(--progress) * 20deg);
+}
+
+/* The character clip is on pure black, so `screen` drops the black and keeps the ghost. */
+.screen-ghost {
+  mix-blend-mode: screen;
+  pointer-events: none;
+  -webkit-mask-image: radial-gradient(closest-side, #000 72%, transparent);
+  mask-image: radial-gradient(closest-side, #000 72%, transparent);
+}
+
+.deck-ghost {
+  position: absolute;
+  left: -9%;
+  bottom: -7%;
+  width: 46%;
+  aspect-ratio: 1;
+  translate: 0 calc(var(--bass) * -0.75rem);
+}
+
+/* ── Seek bars (hero, mini player) ───────────────────────────────────── */
+
+.seek {
+  --fill: var(--color-foreground);
+  appearance: none;
+  height: 1rem;
+  background: transparent;
+  cursor: pointer;
+}
+
+.seek::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 9999px;
+  background: linear-gradient(
+    to right,
+    var(--fill) var(--seek, 0%),
+    color-mix(in oklch, var(--color-foreground) 18%, transparent) var(--seek, 0%)
+  );
+}
+
+.seek::-moz-range-track {
+  height: 4px;
+  border-radius: 9999px;
+  background: color-mix(in oklch, var(--color-foreground) 18%, transparent);
+}
+
+.seek::-moz-range-progress {
+  height: 4px;
+  border-radius: 9999px;
+  background: var(--fill);
+}
+
+.seek::-webkit-slider-thumb {
+  appearance: none;
+  margin-top: -4px;
+  width: 12px;
+  height: 12px;
+  border-radius: 9999px;
+  background: var(--color-foreground);
+  transition: scale 0.15s;
+}
+
+.seek::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border: 0;
+  border-radius: 9999px;
+  background: var(--color-foreground);
+}
+
+.seek:hover::-webkit-slider-thumb {
+  scale: 1.25;
+}
+
+/* Cuts the conic fill down to a 2px ring. */
+.progress-ring {
+  -webkit-mask: radial-gradient(closest-side, transparent calc(100% - 2px), #000 calc(100% - 2px));
+  mask: radial-gradient(closest-side, transparent calc(100% - 2px), #000 calc(100% - 2px));
+}
+
+/* ── Film stage ──────────────────────────────────────────────────────── */
+
+/* Taller than the viewport; the frame pins inside it and grows to full bleed. */
 .film-stage {
   position: relative;
   height: 185svh;
-  /*
-   * The timeline is named on the stage and consumed by the frame inside it, rather than the frame
-   * reading its own `view()`. A sticky element stops moving relative to the scrollport the moment
-   * it pins, so its own view progress freezes exactly when the growth is supposed to happen. The
-   * stage never pins, so its progress is the honest one.
-   */
   view-timeline-name: --film;
 }
 
@@ -243,34 +450,46 @@ html {
   justify-content: center;
 }
 
-/*
- * Cut to the footage, not the other way round.
- *
- * The capture is 4:3, so the frame is too — a 16:9 stage would crop the app's own titlebar and
- * player bar off the top and bottom, which are the parts that make it read as a desktop window.
- * At full size that makes the height the limiting dimension, hence the width ceiling.
- */
+/* Cut to the 4:3 capture, so the app's titlebar and player bar stay in frame. */
 .film-frame {
   position: relative;
-  width: min(70%, calc(100svh * 4 / 3));
+  width: min(72%, calc(100svh * 4 / 3));
   aspect-ratio: 4 / 3;
   overflow: hidden;
   border-radius: 20px;
-  background: #000;
-  box-shadow: 0 8px 40px rgb(0 0 0 / 0.45);
+  background: var(--color-shadow);
+  box-shadow:
+    0 30px 120px -40px color-mix(in oklch, var(--color-primary) 45%, transparent),
+    inset 0 0 0 1px color-mix(in oklch, var(--color-foreground) 8%, transparent);
+}
+
+/* Phones: the frame cannot grow much, so it starts wide and the pin is short. */
+@media (max-width: 640px) {
+  .film-stage {
+    height: 125svh;
+  }
+
+  .film-frame {
+    width: 92%;
+  }
+}
+
+.film-glow {
+  position: absolute;
+  inset: 25% 20%;
+  border-radius: 50%;
+  pointer-events: none;
+  background: radial-gradient(closest-side, color-mix(in oklch, var(--color-primary) 40%, transparent), transparent);
+  filter: blur(80px);
+  opacity: calc(0.35 + var(--level) * 0.5);
 }
 
 @supports (animation-timeline: view()) {
   @media (prefers-reduced-motion: no-preference) {
+    /* The stage never pins, so its view progress keeps moving while the frame is held still. */
     .film-frame {
       animation: film-grow linear both;
       animation-timeline: --film;
-      /*
-       * `contain` is the phase where the stage completely covers the viewport — which, because the
-       * stage is taller than the viewport, is precisely the span during which the frame is pinned.
-       * So the frame stays small while it slides up into place and grows only once it is holding
-       * still, over the first half of the pin.
-       */
       animation-range: contain 0% contain 45%;
     }
   }
@@ -278,8 +497,8 @@ html {
 
 @keyframes film-grow {
   from {
-    transform: scale(0.68);
-    border-radius: 24px;
+    transform: scale(0.7);
+    border-radius: 28px;
   }
   to {
     transform: scale(1);
@@ -287,71 +506,236 @@ html {
   }
 }
 
-/*
- * The wordmark's cursor.
- *
- * `zuno_` ends in an underscore, so it is already a prompt — this just admits it. The one
- * piece of motion in the hero, and it belongs to the logo rather than being applied to it.
- * Steady rather than absent under reduced motion, since the block is part of the mark.
- */
-.caret {
-  animation: caret-blink 1.2s steps(1) infinite;
+/* ── Bento ───────────────────────────────────────────────────────────── */
+
+/* A soft light that follows the pointer; --mx/--my are set by Features. */
+.spotlight {
+  position: relative;
+  isolation: isolate;
 }
 
-@keyframes caret-blink {
-  0%,
-  50% {
-    opacity: 1;
-  }
-  50.01%,
-  100% {
-    opacity: 0;
-  }
+.spotlight::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  pointer-events: none;
+  background: radial-gradient(
+    26rem circle at var(--mx, 50%) var(--my, 0%),
+    color-mix(in oklch, var(--color-foreground) 7%, transparent),
+    transparent 65%
+  );
+  opacity: 0;
+  transition: opacity 0.35s;
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .caret {
-    animation: none;
-    opacity: 1;
-  }
+.spotlight:hover::before {
+  opacity: 1;
 }
 
-/*
- * The playing indicator, shared by the tab demo and the bento cells.
- *
- * Three bars on staggered delays. Paused rather than removed under reduced motion, so the mark
- * still reads as "this is the one playing" without the movement.
- */
-.equaliser-bar {
+/* Vertical EQ faders. The 4px rail is painted, so the thumb needs no centring offset. */
+.eq-slider {
+  appearance: none;
+  writing-mode: vertical-lr;
+  direction: rtl;
+  width: 16px;
   height: 100%;
-  animation: equalise 1.1s ease-in-out infinite alternate;
-  transform-origin: bottom;
+  background: transparent;
+  cursor: ns-resize;
 }
 
-@keyframes equalise {
-  from {
-    transform: scaleY(0.35);
-  }
-  to {
-    transform: scaleY(1);
-  }
+.eq-slider::-webkit-slider-runnable-track {
+  width: 16px;
+  border-radius: 9999px;
+  background: linear-gradient(
+      to top,
+      var(--color-muted) var(--lo),
+      var(--color-primary) var(--lo) var(--hi),
+      var(--color-muted) var(--hi)
+    )
+    center / 4px 100% no-repeat;
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .equaliser-bar {
-    animation: none;
-    transform: scaleY(0.7);
+.eq-slider::-moz-range-track {
+  width: 4px;
+  border-radius: 9999px;
+  background: linear-gradient(
+    to top,
+    var(--color-muted) var(--lo),
+    var(--color-primary) var(--lo) var(--hi),
+    var(--color-muted) var(--hi)
+  );
+}
+
+.eq-slider::-webkit-slider-thumb {
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 9999px;
+  background: var(--color-foreground);
+  box-shadow: 0 0 0 4px color-mix(in oklch, var(--color-primary) 22%, transparent);
+}
+
+.eq-slider::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border: 0;
+  border-radius: 9999px;
+  background: var(--color-foreground);
+}
+
+.eq-zero {
+  stroke: color-mix(in oklch, var(--color-foreground) 14%, transparent);
+  stroke-dasharray: 3 4;
+  vector-effect: non-scaling-stroke;
+}
+
+.eq-curve {
+  fill: none;
+  stroke: var(--color-primary);
+  stroke-width: 2;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.eq-fill {
+  fill: color-mix(in oklch, var(--color-primary) 16%, transparent);
+}
+
+/* ── Footer ──────────────────────────────────────────────────────────── */
+
+.wordmark-xl {
+  font-size: clamp(6rem, 26vw, 24rem);
+  line-height: 0.78;
+  letter-spacing: -0.065em;
+  background: linear-gradient(
+    to bottom,
+    color-mix(in oklch, var(--color-foreground) 16%, transparent),
+    transparent 82%
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* ── Mini player dock ────────────────────────────────────────────────── */
+
+/* Appears once the hero's player scrolls away, the way the app's appears when you look away. */
+.mini-dock {
+  opacity: 0;
+  translate: 0 1rem;
+  pointer-events: none;
+  transition:
+    opacity 0.4s,
+    translate 0.6s var(--ease-out-expo);
+}
+
+html[data-hero-out="true"]:not([data-footer-in="true"]) .mini-dock {
+  opacity: 1;
+  translate: 0 0;
+  pointer-events: auto;
+}
+
+/* ── Shared motion ───────────────────────────────────────────────────── */
+
+@supports (animation-timeline: view()) {
+  @media (prefers-reduced-motion: no-preference) {
+    .reveal {
+      animation: reveal-in linear both;
+      animation-timeline: view();
+      animation-range: entry 0% cover 20%;
+    }
   }
 }
 
 @keyframes reveal-in {
   from {
     opacity: 0;
-    transform: translateY(1.25rem);
+    transform: translateY(1.5rem);
+  }
+}
+
+/* Decorative loops exist only when motion is welcome: collapsing them to 0ms would strobe. */
+@media (prefers-reduced-motion: no-preference) {
+  .record-spin {
+    animation: spin 1.8s linear infinite;
+    animation-play-state: paused;
+  }
+
+  html[data-playing="true"] .record-spin {
+    animation-play-state: running;
+  }
+
+  .float {
+    animation: float-y 3.4s ease-in-out infinite alternate;
+  }
+
+  .equaliser-bar {
+    animation: equalise 1.1s ease-in-out infinite alternate;
+    animation-play-state: paused;
+  }
+
+  html[data-playing="true"] .equaliser-bar {
+    animation-play-state: running;
+  }
+
+  .dl-bar {
+    animation: dl-fill 4.8s var(--ease-out-expo) infinite;
+  }
+
+  .nudge {
+    animation: nudge 1.6s var(--ease-out-expo) infinite;
+  }
+}
+
+.equaliser-bar {
+  height: 100%;
+  transform-origin: bottom;
+  scale: 1 0.6;
+}
+
+@keyframes spin {
+  to {
+    rotate: 360deg;
+  }
+}
+
+@keyframes float-y {
+  from {
+    translate: 0 -0.35rem;
   }
   to {
-    opacity: 1;
-    transform: none;
+    translate: 0 0.35rem;
+  }
+}
+
+@keyframes equalise {
+  from {
+    scale: 1 0.3;
+  }
+  to {
+    scale: 1 1;
+  }
+}
+
+@keyframes dl-fill {
+  0% {
+    scale: 0 1;
+  }
+  75%,
+  100% {
+    scale: 1 1;
+  }
+}
+
+@keyframes nudge {
+  0%,
+  100% {
+    translate: 0 0;
+  }
+  50% {
+    translate: 0 0.25rem;
   }
 }
 
@@ -360,10 +744,12 @@ html {
     scroll-behavior: auto;
   }
 
-  *,
-  *::before,
-  *::after {
-    animation-duration: 0.001ms !important;
-    transition-duration: 0.001ms !important;
+  .rise,
+  .caret {
+    animation: none;
+  }
+
+  .tonearm {
+    transition: none;
   }
 }
