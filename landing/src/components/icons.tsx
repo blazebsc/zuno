@@ -1,13 +1,6 @@
 import type { SVGProps } from "react";
 
-/**
- * Icons, hand-rolled rather than pulled from Solar.
- *
- * The app routes every icon through `@/ui/icons` and pays for ~1.2k modules of Solar to do it.
- * This page needs six glyphs; a dependency and a barrel import for that would be the tail
- * wagging the dog. Sized and stroked to match Solar Linear (24px box, 1.5 stroke) so they sit
- * correctly beside the app's own screenshots.
- */
+// Hand-rolled to match Solar Linear (24px box, 1.5 stroke); a dozen glyphs do not justify an icon package.
 type IconProps = SVGProps<SVGSVGElement> & { size?: number };
 
 function Icon({ size = 20, children, ...props }: IconProps) {
@@ -40,13 +33,6 @@ export function DownloadIcon(props: IconProps) {
   );
 }
 
-/*
- * Bare direction arrows, for the two hero actions.
- *
- * `DownloadIcon` has a tray under it, which promises a file. Both hero buttons only move you —
- * one down the page to the tiles, one out to the repository — so both get an arrow and nothing
- * else, and the direction is the whole message.
- */
 export function ArrowDownIcon(props: IconProps) {
   return (
     <Icon {...props}>
@@ -65,7 +51,25 @@ export function ArrowRightIcon(props: IconProps) {
   );
 }
 
-/* Transport glyphs are solid — a hairline triangle reads as an arrow, not a play button. */
+export function ArrowUpRightIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="M7 17 17 7" />
+      <path d="M8 7h9v9" />
+    </Icon>
+  );
+}
+
+export function ArrowsHorizontalIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="m8 7-5 5 5 5" />
+      <path d="m16 7 5 5-5 5" />
+    </Icon>
+  );
+}
+
+// Transport glyphs are solid: a hairline triangle reads as an arrow, not a play button.
 export function PlayIcon(props: IconProps) {
   return (
     <Icon fill="currentColor" stroke="none" {...props}>
@@ -83,31 +87,6 @@ export function PauseIcon(props: IconProps) {
   );
 }
 
-/** One glyph, two states: the waves are dropped when muted rather than drawing a second icon. */
-export function SpeakerIcon({ muted, ...props }: IconProps & { muted?: boolean }) {
-  return (
-    <Icon {...props}>
-      <path
-        d="M4 9.5h3l4.3-3.6a.8.8 0 0 1 1.3.6v11a.8.8 0 0 1-1.3.6L7 14.5H4a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1Z"
-        fill="currentColor"
-        stroke="none"
-      />
-      {muted ? (
-        <>
-          <path d="m17 10 4 4" />
-          <path d="m21 10-4 4" />
-        </>
-      ) : (
-        <>
-          <path d="M16.5 9.5a3.5 3.5 0 0 1 0 5" />
-          <path d="M19 7a7 7 0 0 1 0 10" />
-        </>
-      )}
-    </Icon>
-  );
-}
-
-/** One glyph mirrored by the caller — a skip is the same shape pointed the other way. */
 export function SkipIcon({ back, ...props }: IconProps & { back?: boolean }) {
   return (
     <Icon fill="currentColor" stroke="none" {...props}>
@@ -127,11 +106,55 @@ export function CheckIcon(props: IconProps) {
   );
 }
 
+export function CopyIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <rect x="8.5" y="8.5" width="12" height="12" rx="2.5" />
+      <path d="M15.5 8.5V6a2.5 2.5 0 0 0-2.5-2.5H6A2.5 2.5 0 0 0 3.5 6v7A2.5 2.5 0 0 0 6 15.5h2.5" />
+    </Icon>
+  );
+}
+
+export function StarIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="m12 3.5 2.6 5.3 5.9.9-4.3 4.1 1 5.8L12 16.9l-5.2 2.7 1-5.8-4.3-4.1 5.9-.9L12 3.5Z" />
+    </Icon>
+  );
+}
+
 export function ShieldIcon(props: IconProps) {
   return (
     <Icon {...props}>
       <path d="M12 3l7 3v5.5c0 4.3-3 8.2-7 9.5-4-1.3-7-5.2-7-9.5V6l7-3Z" />
       <path d="m9 12 2 2 4-4" />
+    </Icon>
+  );
+}
+
+export function UserIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <circle cx="12" cy="8" r="3.5" />
+      <path d="M5 20c.8-3.6 3.6-5.5 7-5.5s6.2 1.9 7 5.5" />
+    </Icon>
+  );
+}
+
+export function CodeIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="m8 8-4 4 4 4" />
+      <path d="m16 8 4 4-4 4" />
+      <path d="m13.5 5-3 14" />
+    </Icon>
+  );
+}
+
+export function FolderIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <path d="M3.5 7.5A2 2 0 0 1 5.5 5.5h3.6l2 2.2h7.4a2 2 0 0 1 2 2v7.8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2V7.5Z" />
     </Icon>
   );
 }

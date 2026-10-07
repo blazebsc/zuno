@@ -1,18 +1,7 @@
 import { Icon, addIcon } from "@iconify/react";
 import type { ComponentProps } from "react";
 
-/*
- * Six Iconify glyphs, inlined.
- *
- * Iconify normally fetches icons from its API at runtime, which means a network round trip and
- * a visible pop-in for the first paint of a download section — the one place on this page where
- * the icons *are* the wayfinding. The full `@iconify-json/logos` set is 7.4 MB, so bundling it
- * is not an option either.
- *
- * These six are extracted from that package and registered up front, so they render on the
- * first frame with no request. Regenerate by re-running the extraction if a mark changes; the
- * package stays a devDependency purely as the source of record.
- */
+// Iconify marks extracted from @iconify-json/logos and registered up front: no runtime fetch, no pop-in.
 const ICONS: Record<string, { body: string; width: number; height: number }> = {
   "microsoft-windows-icon": {"body":"<path fill=\"#0078d4\" d=\"M0 0h121.329v121.329H0zm134.671 0H256v121.329H134.671zM0 134.671h121.329V256H0zm134.671 0H256V256H134.671z\"/>","width":256,"height":256},
   // Apple's mark is a solid silhouette with no fill in the source, which SVG resolves to black —
@@ -28,7 +17,12 @@ for (const [name, data] of Object.entries(ICONS)) {
   addIcon(`logos:${name}`, data);
 }
 
-/** Brand marks keep their own colours; `color: unset` stops a parent text colour flattening them. */
+// GitHub's mark ships near-black, invisible on this page; this copy takes the text colour.
+addIcon("logos:github-mono", {
+  ...ICONS["github-icon"],
+  body: ICONS["github-icon"].body.replace('fill="#161614"', 'fill="currentColor"'),
+});
+
 export function BrandIcon(props: ComponentProps<typeof Icon>) {
   return <Icon {...props} />;
 }
@@ -37,16 +31,11 @@ export const OS_ICON = {
   windows: "logos:microsoft-windows-icon",
   macos: "logos:apple",
   linux: "logos:linux-tux",
-  github: "logos:github-icon",
 } as const;
 
-/**
- * The two services Zuno talks to, for the hero's floating badges.
- *
- * Aspect ratios differ wildly and both are wrong to guess at: the Discord mark is 256×199 and
- * the Last.fm one is the wordmark at 512×131, so each call site sizes its own.
- */
+// Aspect ratios differ (Discord 256×199, Last.fm 512×131), so each call site sizes its own.
 export const SERVICE_ICON = {
   discord: "logos:discord-icon",
   lastfm: "logos:lastfm",
+  github: "logos:github-mono",
 } as const;
