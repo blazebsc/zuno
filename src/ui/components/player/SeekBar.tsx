@@ -244,7 +244,7 @@ export function SeekBar() {
 
   return (
     <div className="group/seek flex w-full items-center gap-2.5">
-      <span className="w-10 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
+      <span className="min-w-10 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
         {formatTime(currentTime)}
       </span>
       <input
@@ -266,7 +266,7 @@ export function SeekBar() {
         } as React.CSSProperties}
         aria-label="Seek"
       />
-      <span className="w-10 shrink-0 text-xs tabular-nums text-muted-foreground mr-4">
+      <span className="min-w-10 shrink-0 text-xs tabular-nums text-muted-foreground">
         {formatTime(duration)}
       </span>
     </div>
