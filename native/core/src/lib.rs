@@ -35,6 +35,7 @@ pub mod rng;
 pub mod search;
 pub mod theme;
 
-pub use app::{AppState, View};
+pub use app::{AppState, View, LibraryTab, RepeatMode};
+pub use queue::{Queue, Region};
 pub use model::{Album, AlbumId, Artist, ArtistId, Playlist, PlaylistId, Track, TrackId};
 pub use player::PlayerHandle;

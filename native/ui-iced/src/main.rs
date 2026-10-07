@@ -1,0 +1,1358 @@
+//! Zuno — iced implementation of the native-GUI benchmark (gui/iced branch).
+//!
+//! Renders the shared `zuno_core::AppState` per docs/gui-benchmarks/SPEC.md.
+//! iced has no list virtualization; rows use `lazy` for view caching — the
+//! same trade the React app makes with `content-visibility`. That is an
+//! honest part of the benchmark, recorded in the branch report.
+//!
+//! Every widget style comes from a named function in `style` — inline
+//! `move |_t| …` closures inside `column![]` macros defeat type inference.
+
+mod icons;
+mod style;
+
+use iced::keyboard::key::Named;
+use iced::widget::{
+    button, canvas, column, container, image, lazy, mouse_area, row, scrollable, slider,
+    stack, svg, text, text_input, Space,
+};
+use iced::{
+    alignment, Color, Element, Length, Padding, Rectangle, Subscription, Task,
+};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::time::Duration;
+use zuno_core::bench::{BenchAction, BenchDriver};
+use zuno_core::format::{count_songs, counts_line, listeners, mmss};
+use zuno_core::model::*;
+use zuno_core::queue::Region;
+use zuno_core::search;
+use zuno_core::theme as t;
+use zuno_core::{AppState, LibraryTab, RepeatMode, View};
+
+const SONGS_SCROLL: &str = "songs-scroll";
+const PAGE_SCROLL: &str = "page-scroll";
+const SEARCH_INPUT: &str = "search-input";
+
+fn main() -> iced::Result {
+    iced::application(Zuno::new, Zuno::update, Zuno::view)
+        .title("Zuno")
+        .theme(|_state: &Zuno| style::iced_theme())
+        .font(include_bytes!("../assets/Inter-Variable.ttf"))
+        .default_font(style::INTER)
+        .window_size((1280.0, 800.0))
+        .subscription(Zuno::subscription)
+        .run()
+}
+
+#[derive(Clone, Debug)]
+pub enum Message {
+    Tick,
+    Resized(f32),
+    Nav(View),
+    LibraryTab(LibraryTab),
+    SearchInput(String),
+    FocusSearch,
+    OpenAlbum(AlbumId),
+    OpenArtist(ArtistId),
+    OpenPlaylist(PlaylistId),
+    PlayFrom(Vec<TrackId>, usize),
+    PlayShuffled(Vec<TrackId>),
+    PlayTrack(TrackId),
+    TogglePlay,
+    Next,
+    Previous,
+    Seek(f32),
+    SeekDelta(f32),
+    SetVolume(f32),
+    ToggleMute,
+    ToggleShuffle,
+    CycleRepeat,
+    ToggleLike(TrackId),
+    QueueToggle,
+    QueueJump(usize),
+    QueueRemove(usize),
+    Back,
+    CardHover(Option<u64>),
+    Escape,
+}
+
+pub struct Zuno {
+    pub app: AppState,
+    pub handles: RefCell<HashMap<(u64, u32), image::Handle>>,
+    pub hover_card: Option<u64>,
+    pub queue_open: bool,
+    pub frame: u64,
+    pub window_width: f32,
+    pub bench: Option<BenchDriver>,
+}
+
+impl Zuno {
+    fn new() -> (Self, Task<Message>) {
+        let bench = if std::env::args().any(|a| a == "--bench") {
+            Some(BenchDriver::new())
+        } else {
+            None
+        };
+        (
+            Zuno {
+                app: AppState::new(),
+                handles: RefCell::new(HashMap::new()),
+                hover_card: None,
+                queue_open: false,
+                frame: 0,
+                window_width: 1280.0,
+                bench,
+            },
+            Task::none(),
+        )
+    }
+
+    fn update(&mut self, message: Message) -> Task<Message> {
+        self.app.tick();
+        match message {
+            Message::Tick => {
+                self.frame = self.frame.wrapping_add(1);
+                if let Some(b) = &mut self.bench {
+                    match b.tick() {
+                        BenchAction::RecordStartup => {}
+                        BenchAction::ScrollTo(f) => {
+                            self.app.view = View::Library;
+                            self.app.library_tab = LibraryTab::Songs;
+                            return scroll_to_frac(SONGS_SCROLL, f);
+                        }
+                        BenchAction::SelectRow(i) => self.app.selection = Some(i),
+                        BenchAction::StartPlayback => {
+                            let ids = self.app.list_ids();
+                            self.app.play_from(&ids, ids.len() / 2);
+                        }
+                        BenchAction::Finish => {
+                            println!("{}", b.report);
+                            std::process::exit(0);
+                        }
+                        BenchAction::Nothing => {}
+                    }
+                }
+            }
+            Message::Resized(w) => self.window_width = w,
+            Message::Nav(view) => self.app.go(view),
+            Message::LibraryTab(tab) => self.app.set_library_tab(tab),
+            Message::SearchInput(q) => self.app.set_search(&q),
+            Message::FocusSearch => {
+                self.app.go(View::Search);
+                return iced::widget::operation::focus(SEARCH_INPUT);
+            }
+            Message::OpenAlbum(id) => self.app.open_album(id),
+            Message::OpenArtist(id) => self.app.open_artist(id),
+            Message::OpenPlaylist(id) => self.app.open_playlist(id),
+            Message::PlayFrom(list, i) => self.app.play_from(&list, i),
+            Message::PlayShuffled(list) => {
+                self.app.play_from(&list, 0);
+                if !self.app.shuffle {
+                    self.app.toggle_shuffle();
+                }
+            }
+            Message::PlayTrack(id) => self.app.play_track(id),
+            Message::TogglePlay => self.app.toggle_play(),
+            Message::Next => self.app.next(),
+            Message::Previous => self.app.previous(),
+            Message::Seek(pos) => self.app.seek(pos as f64),
+            Message::SeekDelta(d) => self.app.seek(self.app.player.position_sec() + d as f64),
+            Message::SetVolume(v) => self.app.set_volume(v / 100.0),
+            Message::ToggleMute => self.app.toggle_mute(),
+            Message::ToggleShuffle => self.app.toggle_shuffle(),
+            Message::CycleRepeat => self.app.cycle_repeat(),
+            Message::ToggleLike(id) => self.app.toggle_like(id),
+            Message::QueueToggle => self.queue_open = !self.queue_open,
+            Message::QueueJump(i) => {
+                if let Some(id) = self.app.queue.jump_to(i) {
+                    self.app.play_track(id);
+                }
+            }
+            Message::QueueRemove(i) => {
+                self.app.queue.remove_at(i);
+            }
+            Message::Back => {
+                self.app.go_back();
+            }
+            Message::CardHover(seed) => self.hover_card = seed,
+            Message::Escape => {
+                if !self.app.search_query.is_empty() {
+                    self.app.search_query.clear();
+                } else {
+                    self.app.go_back();
+                }
+            }
+        }
+        Task::none()
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        Subscription::batch([
+            iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick),
+            iced::window::resize_events().map(|(_id, size)| Message::Resized(size.width)),
+            iced::keyboard::listen().filter_map(keyboard_event),
+        ])
+    }
+
+    pub fn art(&self, seed: u64, size: u32) -> image::Handle {
+        let mut handles = self.handles.borrow_mut();
+        handles
+            .entry((seed, size))
+            .or_insert_with(|| {
+                let buf = self.app.artwork.get(seed, size);
+                image::Handle::from_rgba(size, size, buf.to_vec())
+            })
+            .clone()
+    }
+
+    // — Shell ———————————————————————————————————————————————————————
+
+    fn view(&self) -> Element<'_, Message> {
+        let sidebar = self.view_sidebar();
+        let content = container(self.view_page())
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(style::container_bg());
+        let middle = row![sidebar, content].height(Length::Fill);
+        let base = column![middle, self.view_player_bar()].spacing(0);
+        let page: Element<'_, Message> =
+            container(base).width(Length::Fill).height(Length::Fill).style(style::container_bg()).into();
+        if self.queue_open {
+            let rail = container(self.view_queue())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(alignment::Horizontal::Right)
+                .style(style::container_plain());
+            stack![page, rail].width(Length::Fill).height(Length::Fill).into()
+        } else {
+            page
+        }
+    }
+
+    // — Sidebar ———————————————————————————————————————————————————————
+
+    fn view_sidebar(&self) -> Element<'_, Message> {
+        let is = |target: &View| &self.app.view == target;
+        let mut nav_col = column![
+            nav_item("Home", icons::HOME, is(&View::Home), Message::Nav(View::Home)),
+            nav_item("Search", icons::SEARCH, is(&View::Search), Message::Nav(View::Search)),
+            nav_item("Library", icons::LIBRARY, is(&View::Library), Message::Nav(View::Library)),
+            nav_item("Settings", icons::SETTINGS, is(&View::Settings), Message::Nav(View::Settings)),
+        ]
+        .spacing(2);
+        nav_col = nav_col.push(Space::new().width(Length::Fill).height(Length::Fixed(18.0)));
+        nav_col = nav_col.push(
+            container(
+                text("PLAYLISTS").font(style::font(600)).size(11.0).style(style::text_muted()),
+            )
+            .padding(Padding { left: 12.0, ..Padding::ZERO }),
+        );
+        nav_col = nav_col.push(Space::new().width(Length::Fill).height(Length::Fixed(6.0)));
+
+        let mut rows = column![self.playlist_row(0)].spacing(1);
+        for p in &self.app.library.playlists[1..] {
+            rows = rows.push(self.playlist_row(p.id));
+        }
+        let playlists_scroll = scrollable(rows.spacing(1))
+            .direction(scrollable::Direction::Vertical(
+                scrollable::Scrollbar::new().width(4).scroller_width(4),
+            ))
+            .style(style::scrollable())
+            .height(Length::Fill);
+        let col = column![nav_col, playlists_scroll].spacing(8).height(Length::Fill);
+        container(col)
+            .width(Length::Fixed(t::SIDEBAR_W))
+            .height(Length::Fill)
+            .padding(Padding { top: 16.0, left: 12.0, right: 12.0, ..Padding::ZERO })
+            .style(style::container_bg())
+            .into()
+    }
+
+    fn playlist_row(&self, id: PlaylistId) -> Element<'_, Message> {
+        let Some(p) = self.app.library.playlist(id) else {
+            return row![].into();
+        };
+        let seed = AppState::playlist_seed(p.id);
+        let active = matches!(self.app.view, View::Playlist(v) if v == p.id);
+        let count = p.track_ids.len();
+        let body = row![
+            container(
+                image(self.art(seed, 40))
+                    .width(Length::Fixed(40.0))
+                    .height(Length::Fixed(40.0))
+                    .content_fit(iced::ContentFit::Cover)
+            )
+            .clip(true)
+            .style(style::container_art()),
+            column![
+                text(p.title.as_str()).font(style::font(500)).size(t::SMALL.size + 1.0),
+                text(format!("{count} songs"))
+                    .font(style::font(400))
+                    .size(t::SMALL.size)
+                    .style(style::text_muted()),
+            ]
+            .spacing(2),
+        ]
+        .spacing(10)
+        .align_y(alignment::Vertical::Center);
+        button(body)
+            .width(Length::Fill)
+            .height(Length::Fixed(48.0))
+            .padding(Padding { left: 8.0, right: 8.0, top: 4.0, bottom: 4.0 })
+            .style(style::nav_button(active, false))
+            .on_press(Message::OpenPlaylist(p.id))
+            .into()
+    }
+
+    // — Page router ————————————————————————————————————————————
+
+    fn view_page(&self) -> Element<'_, Message> {
+        match &self.app.view {
+            View::Home => self.view_home(),
+            View::Library => self.view_library(),
+            View::Album(id) => self.view_collection(
+                AppState::album_seed(*id),
+                self.app.library.album(*id).title.clone(),
+                format!(
+                    "{} · {}",
+                    self.app.library.album(*id).kind.label(),
+                    self.app.library.artist(self.app.library.album(*id).artist_id).name
+                ),
+                self.app.library.album(*id).track_ids.clone(),
+            ),
+            View::Playlist(id) => {
+                let p = self.app.library.playlist(*id).expect("playlist exists");
+                self.view_collection(
+                    AppState::playlist_seed(*id),
+                    p.title.clone(),
+                    format!("Playlist · {}", p.description.as_deref().unwrap_or("Curated by you")),
+                    p.track_ids.clone(),
+                )
+            }
+            View::Artist(id) => self.view_artist(*id),
+            View::Search => self.view_search(),
+            View::Settings => self.view_settings(),
+        }
+    }
+
+    // — Home ———————————————————————————————————————————————————————
+
+    fn view_home(&self) -> Element<'_, Message> {
+        let mut col = column![
+            column![
+                style::h1("Home"),
+                text("Pick up where you left off")
+                    .font(style::font(400))
+                    .size(t::SMALL.size)
+                    .style(style::text_muted()),
+            ]
+            .spacing(4)
+            .padding(Padding { top: 24.0, ..Padding::ZERO }),
+        ]
+        .spacing(t::SECTION_GAP);
+
+        col = col.push(shelf(
+            "Recently played",
+            self.app.library.home_recent_albums(12).into_iter().map(|aid| self.album_card(aid)).collect(),
+        ));
+        col = col.push(shelf(
+            "Made for you",
+            self.app
+                .library
+                .mixes
+                .iter()
+                .map(|m| {
+                    self.generic_card(
+                        AppState::playlist_seed(m.id),
+                        m.title.clone(),
+                        m.description.clone().unwrap_or_default(),
+                        Message::OpenPlaylist(m.id),
+                    )
+                })
+                .collect(),
+        ));
+
+        let mut album_ids: Vec<AlbumId> = (0..self.app.library.albums.len() as u32).collect();
+        album_ids.sort_by_key(|&a| std::cmp::Reverse(self.app.library.album(a).year));
+        album_ids.truncate(24);
+        let mut grid = iced::widget::grid::Grid::new().columns(self.grid_columns()).spacing(16);
+        for aid in album_ids {
+            grid = grid.push(self.album_card(aid));
+        }
+        col = col.push(column![style::h2("New albums"), container(grid).width(Length::Fill)].spacing(12));
+
+        let mut artist_ids: Vec<ArtistId> = (0..self.app.library.artists.len() as u32).collect();
+        artist_ids.sort_by_key(|&r| std::cmp::Reverse(self.app.library.artist(r).monthly_listeners));
+        artist_ids.truncate(12);
+        col = col.push(shelf(
+            "Popular artists",
+            artist_ids
+                .into_iter()
+                .map(|rid| {
+                    let a = self.app.library.artist(rid);
+                    let art = self.art(AppState::artist_seed(rid), 176);
+                    mouse_area(
+                        container(
+                            column![
+                                container(
+                                    image(art)
+                                        .width(Length::Fixed(160.0))
+                                        .height(Length::Fixed(160.0))
+                                        .content_fit(iced::ContentFit::Cover)
+                                )
+                                .clip(true)
+                                .style(style::container_art_round()),
+                                Space::new().width(Length::Fill).height(Length::Fixed(6.0)),
+                                text(a.name.clone()).font(style::font(500)).size(t::BODY.size),
+                                text(listeners(a.monthly_listeners))
+                                    .font(style::font(400))
+                                    .size(t::SMALL.size)
+                                    .style(style::text_muted()),
+                            ]
+                            .spacing(4)
+                            .width(Length::Fixed(160.0)),
+                        ),
+                    )
+                    .on_press(Message::OpenArtist(rid))
+                    .into()
+                })
+                .collect(),
+        ));
+
+        page_scroll(
+            container(col)
+                .width(Length::Fill)
+                .padding(Padding { left: t::PAGE_PAD, right: t::PAGE_PAD, bottom: t::PAGE_PAD, ..Padding::ZERO })
+                .into(),
+        )
+    }
+
+    fn grid_columns(&self) -> usize {
+        (((self.window_width - t::SIDEBAR_W - 2.0 * t::PAGE_PAD) / (t::CARD_W + 16.0)).floor() as usize)
+            .clamp(2, 8)
+    }
+
+    fn album_card(&self, aid: AlbumId) -> Element<'_, Message> {
+        let album = self.app.library.album(aid);
+        let artist = self.app.library.artist(album.artist_id);
+        self.generic_card(
+            AppState::album_seed(aid),
+            album.title.clone(),
+            format!("{} · {}", artist.name, album.year),
+            Message::OpenAlbum(aid),
+        )
+    }
+
+    /// AlbumCard from the spec: square art, hover scrim with a red play pill.
+    fn generic_card(
+        &self,
+        seed: u64,
+        title: String,
+        subtitle: String,
+        on_open: Message,
+    ) -> Element<'_, Message> {
+        let hovered = self.hover_card == Some(seed);
+        let art = image(self.art(seed, 176))
+            .width(Length::Fixed(t::CARD_W))
+            .height(Length::Fixed(t::CARD_W))
+            .content_fit(iced::ContentFit::Cover);
+        let mut layers = stack![container(art).clip(true)];
+        if hovered {
+            layers = layers.push(
+                container(
+                    button(
+                        container(icon(icons::PLAY, 22.0, Color::WHITE))
+                            .width(Length::Fixed(44.0))
+                            .height(Length::Fixed(44.0))
+                            .align_x(alignment::Horizontal::Center)
+                            .align_y(alignment::Vertical::Center),
+                    )
+                    .style(style::primary_pill())
+                    .on_press(on_open.clone()),
+                )
+                .width(Length::Fixed(t::CARD_W))
+                .height(Length::Fixed(t::CARD_W))
+                .align_x(alignment::Horizontal::Center)
+                .align_y(alignment::Vertical::Center)
+                .style(style::container_scrim()),
+            );
+        }
+        let card = column![
+            mouse_area(layers)
+                .on_enter(Message::CardHover(Some(seed)))
+                .on_exit(Message::CardHover(None)),
+            Space::new().width(Length::Fill).height(Length::Fixed(8.0)),
+            text(title).font(style::font(500)).size(t::BODY.size).width(Length::Fixed(t::CARD_W)),
+            text(subtitle)
+                .font(style::font(400))
+                .size(t::SMALL.size)
+                .style(style::text_muted())
+                .width(Length::Fixed(t::CARD_W)),
+        ]
+        .spacing(2);
+        mouse_area(container(card).width(Length::Fixed(t::CARD_W + 8.0)))
+            .on_press(on_open)
+            .into()
+    }
+
+    // — Library (the 5,000-row large-list surface) ————————————
+
+    fn view_library(&self) -> Element<'_, Message> {
+        let mut col = column![
+            container(page_header("Your Library", self.app.can_go_back()))
+                .padding(Padding { top: 18.0, ..Padding::ZERO })
+        ]
+        .spacing(16.0);
+
+        col = col.push(
+            row![
+                tab_button("Playlists", LibraryTab::Playlists, self.app.library_tab == LibraryTab::Playlists),
+                tab_button("Albums", LibraryTab::Albums, self.app.library_tab == LibraryTab::Albums),
+                tab_button("Artists", LibraryTab::Artists, self.app.library_tab == LibraryTab::Artists),
+                tab_button("Songs", LibraryTab::Songs, self.app.library_tab == LibraryTab::Songs),
+            ]
+            .spacing(8),
+        );
+
+        let body: Element<'_, Message> = match self.app.library_tab {
+            LibraryTab::Songs => {
+                let ids = self.app.list_ids();
+                let mut rows = column![].spacing(1);
+                for (i, &id) in ids.iter().enumerate() {
+                    rows = rows.push(self.track_row(i, id, &ids));
+                }
+                scrollable(rows)
+                    .id(SONGS_SCROLL)
+                    .direction(scrollable::Direction::Vertical(
+                        scrollable::Scrollbar::new().width(4).scroller_width(4),
+                    ))
+                    .style(style::scrollable())
+                    .height(Length::Fill)
+                    .width(Length::Fill)
+                    .into()
+            }
+            LibraryTab::Albums => {
+                let mut grid = iced::widget::grid::Grid::new().columns(self.grid_columns()).spacing(16);
+                for aid in 0..self.app.library.albums.len() as u32 {
+                    grid = grid.push(self.album_card(aid));
+                }
+                page_scroll(
+                    container(grid).width(Length::Fill).padding(Padding { top: 8.0, ..Padding::ZERO }).into(),
+                )
+            }
+            LibraryTab::Artists => {
+                let mut rows = column![].spacing(2);
+                for rid in 0..self.app.library.artists.len() as u32 {
+                    let a = self.app.library.artist(rid);
+                    rows = rows.push(
+                        button(
+                            row![
+                                container(
+                                    image(self.art(AppState::artist_seed(rid), 40))
+                                        .width(Length::Fixed(40.0))
+                                        .height(Length::Fixed(40.0))
+                                        .content_fit(iced::ContentFit::Cover)
+                                )
+                                .clip(true)
+                                .style(style::container_art_round()),
+                                column![
+                                    text(a.name.clone()).font(style::font(500)).size(t::BODY.size),
+                                    text(listeners(a.monthly_listeners))
+                                        .font(style::font(400))
+                                        .size(t::SMALL.size)
+                                        .style(style::text_muted()),
+                                ]
+                                .spacing(2),
+                                Space::new().width(Length::Fill).height(Length::Shrink),
+                            ]
+                            .spacing(12)
+                            .align_y(alignment::Vertical::Center),
+                        )
+                        .width(Length::Fill)
+                        .padding(6)
+                        .style(style::row_button(false, false))
+                        .on_press(Message::OpenArtist(rid)),
+                    );
+                }
+                page_scroll(rows.into())
+            }
+            LibraryTab::Playlists => {
+                let mut rows = column![].spacing(2);
+                for p in &self.app.library.playlists {
+                    rows = rows.push(
+                        button(
+                            row![
+                                container(
+                                    image(self.art(AppState::playlist_seed(p.id), 40))
+                                        .width(Length::Fixed(40.0))
+                                        .height(Length::Fixed(40.0))
+                                        .content_fit(iced::ContentFit::Cover)
+                                )
+                                .clip(true)
+                                .style(style::container_art()),
+                                column![
+                                    text(p.title.clone()).font(style::font(500)).size(t::BODY.size),
+                                    text(format!("{} · playlist", count_songs(p.track_ids.len())))
+                                        .font(style::font(400))
+                                        .size(t::SMALL.size)
+                                        .style(style::text_muted()),
+                                ]
+                                .spacing(2),
+                                Space::new().width(Length::Fill).height(Length::Shrink),
+                            ]
+                            .spacing(12)
+                            .align_y(alignment::Vertical::Center),
+                        )
+                        .width(Length::Fill)
+                        .padding(6)
+                        .style(style::row_button(false, false))
+                        .on_press(Message::OpenPlaylist(p.id)),
+                    );
+                }
+                page_scroll(rows.into())
+            }
+        };
+        col = col.push(body);
+        container(col)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(Padding { left: t::PAGE_PAD, right: t::PAGE_PAD, bottom: 8.0, ..Padding::ZERO })
+            .into()
+    }
+
+    // — Album / Playlist (shared collection page) ————————————
+
+    fn view_collection(
+        &self,
+        seed: u64,
+        title: String,
+        subtitle: String,
+        ids: Vec<TrackId>,
+    ) -> Element<'_, Message> {
+        let counts = counts_line(ids.iter().map(|&tid| self.app.library.track(tid).duration_sec));
+        let hero = row![
+            container(
+                image(self.art(seed, 232))
+                    .width(Length::Fixed(232.0))
+                    .height(Length::Fixed(232.0))
+                    .content_fit(iced::ContentFit::Cover),
+            )
+            .clip(true)
+            .style(style::container_card()),
+            column![
+                text(subtitle).font(style::font(400)).size(t::SMALL.size).style(style::text_muted()),
+                style::h1(&title),
+                text(counts).font(style::font(400)).size(t::SMALL.size).style(style::text_muted()),
+                Space::new().width(Length::Fill).height(Length::Fill),
+                row![
+                    primary_pill("Play", icons::PLAY, Message::PlayFrom(ids.clone(), 0)),
+                    ghost_pill("Shuffle", icons::SHUFFLE, Message::PlayShuffled(ids.clone())),
+                ]
+                .spacing(10),
+            ]
+            .spacing(10)
+            .width(Length::Fill)
+            .height(Length::Fixed(232.0)),
+        ]
+        .spacing(24)
+        .padding(Padding { top: 20.0, ..Padding::ZERO });
+
+        let mut rows = column![].spacing(1);
+        for (i, &tid) in ids.iter().enumerate() {
+            rows = rows.push(self.track_row(i, tid, &ids));
+        }
+        let body = column![hero, Space::new().width(Length::Fill).height(Length::Fixed(16.0)), rows]
+            .width(Length::Fill);
+        page_scroll(
+            container(body)
+                .padding(Padding { left: t::PAGE_PAD, right: t::PAGE_PAD, bottom: t::PAGE_PAD, ..Padding::ZERO })
+                .into(),
+        )
+    }
+
+    // — Artist ————————————————————————————————————————————————————
+
+    fn view_artist(&self, id: ArtistId) -> Element<'_, Message> {
+        let a = self.app.library.artist(id);
+        let seed = AppState::artist_seed(id);
+        let top: Vec<TrackId> = self
+            .app
+            .library
+            .albums
+            .iter()
+            .find(|al| al.artist_id == id)
+            .map(|al| al.track_ids.iter().rev().take(10).copied().collect())
+            .unwrap_or_default();
+        let counts = counts_line(top.iter().map(|&tid| self.app.library.track(tid).duration_sec));
+        let hero = row![
+            container(
+                image(self.art(seed, 232))
+                    .width(Length::Fixed(232.0))
+                    .height(Length::Fixed(232.0))
+                    .content_fit(iced::ContentFit::Cover),
+            )
+            .clip(true)
+            .style(style::container_art_round()),
+            column![
+                text("Artist").font(style::font(400)).size(t::SMALL.size).style(style::text_muted()),
+                style::h1(&a.name),
+                text(listeners(a.monthly_listeners)).font(style::font(400)).size(t::SMALL.size).style(style::text_muted()),
+                text(counts).font(style::font(400)).size(t::SMALL.size).style(style::text_muted()),
+                Space::new().width(Length::Fill).height(Length::Fill),
+                row![
+                    primary_pill("Play", icons::PLAY, Message::PlayFrom(top.clone(), 0)),
+                    ghost_pill("Shuffle", icons::SHUFFLE, Message::PlayShuffled(top.clone())),
+                ]
+                .spacing(10),
+            ]
+            .spacing(10)
+            .width(Length::Fill)
+            .height(Length::Fixed(232.0)),
+        ]
+        .spacing(24)
+        .padding(Padding { top: 20.0, ..Padding::ZERO });
+
+        let mut top_rows = column![].spacing(1);
+        for (i, &tid) in top.iter().enumerate() {
+            top_rows = top_rows.push(self.track_row(i, tid, &top));
+        }
+        // The explicit lifetime keeps inference from pinning `col` to
+        // 'static when every initial element happens to be 'static — the
+        // track rows and album cards below borrow `self`.
+        let mut col: iced::widget::Column<'_, Message> =
+            column![hero, Space::new().width(Length::Fill).height(Length::Fixed(20.0))].spacing(10);
+        if !top.is_empty() {
+            col = col.push(style::h2("Top tracks"));
+            col = col.push(top_rows);
+            col = col.push(Space::new().width(Length::Fill).height(Length::Fixed(24.0)));
+        }
+        col = col.push(style::h2("Albums"));
+        let mut grid = iced::widget::grid::Grid::new().columns(self.grid_columns()).spacing(16);
+        for &aid in &a.album_ids {
+            grid = grid.push(self.album_card(aid));
+        }
+        col = col.push(grid);
+        page_scroll(
+            container(col)
+                .width(Length::Fill)
+                .padding(Padding { left: t::PAGE_PAD, right: t::PAGE_PAD, bottom: t::PAGE_PAD, ..Padding::ZERO })
+                .into(),
+        )
+    }
+
+    // — Search ————————————————————————————————————————————————————
+
+    fn view_search(&self) -> Element<'_, Message> {
+        let field = text_input("Search songs, albums, artists…", &self.app.search_query)
+            .on_input(Message::SearchInput)
+            .id(SEARCH_INPUT)
+            .size(t::BODY.size)
+            .padding(Padding { left: 14.0, right: 14.0, top: 9.0, bottom: 9.0 })
+            .style(style::input_search());
+        let mut col = column![container(field).width(Length::Fixed(420.0))].spacing(16);
+
+        let q = self.app.search_query.trim().to_string();
+        if !q.is_empty() {
+            let results = search::search(&self.app.library, &q);
+            if results.tracks.is_empty() {
+                let msg = format!("No results for “{q}”");
+                col = col.push(
+                    container(text(msg).font(style::font(400)).size(t::BODY.size).style(style::text_muted()))
+                        .width(Length::Fill)
+                        .align_x(alignment::Horizontal::Center),
+                );
+            } else {
+                let top_id = results.tracks[0];
+                let tv = self.app.library.track_view(top_id);
+                col = col.push(shelf(
+                    "Top result",
+                    vec![self.generic_card(
+                        AppState::album_seed(tv.album_id),
+                        tv.title.to_string(),
+                        format!("Song · {}", tv.artist),
+                        Message::PlayTrack(top_id),
+                    )],
+                ));
+                let ids = results.tracks.clone();
+                let mut rows = column![].spacing(1);
+                for (i, &tid) in ids.iter().enumerate() {
+                    rows = rows.push(self.track_row(i, tid, &ids));
+                }
+                col = col.push(column![style::h2("Songs"), rows].spacing(12));
+                if !results.albums.is_empty() {
+                    col = col.push(shelf(
+                        "Albums",
+                        results.albums.iter().map(|&aid| self.album_card(aid)).collect(),
+                    ));
+                }
+                if !results.artists.is_empty() {
+                    col = col.push(shelf(
+                        "Artists",
+                        results.artists
+                            .iter()
+                            .map(|&rid| {
+                                let r = self.app.library.artist(rid);
+                                self.generic_card(
+                                    AppState::artist_seed(rid),
+                                    r.name.clone(),
+                                    listeners(r.monthly_listeners),
+                                    Message::OpenArtist(rid),
+                                )
+                            })
+                            .collect(),
+                    ));
+                }
+            }
+        }
+        page_scroll(
+            container(col)
+                .width(Length::Fill)
+                .padding(Padding { left: t::PAGE_PAD, right: t::PAGE_PAD, top: 18.0, bottom: t::PAGE_PAD, ..Padding::ZERO })
+                .into(),
+        )
+    }
+
+    // — Settings ————————————————————————————————————————————————————
+
+    fn view_settings(&self) -> Element<'_, Message> {
+        let col = column![
+            container(page_header("Settings", self.app.can_go_back()))
+                .padding(Padding { top: 18.0, ..Padding::ZERO }),
+            settings_section("Appearance", vec![
+                setting_row("Theme", "Dark (pinned)"),
+                setting_row("Accent", "#FF0033"),
+            ]),
+            settings_section("Playback", vec![
+                setting_row("Streaming quality", "High (256 kbps)"),
+                setting_row("Download quality", "High (256 kbps)"),
+                setting_row("Gapless playback", "On"),
+                setting_row("Crossfade", "Off"),
+                setting_row("Audio engine", "Rust (cpal) — no WebView"),
+            ]),
+            settings_section("Library", vec![
+                setting_row("Cache", "4 GB"),
+                setting_row("Downloads ceiling", "8 GB"),
+            ]),
+        ]
+        .spacing(24);
+        page_scroll(
+            container(col)
+                .width(Length::Fill)
+                .padding(Padding { left: t::PAGE_PAD, right: t::PAGE_PAD, bottom: t::PAGE_PAD, ..Padding::ZERO })
+                .into(),
+        )
+    }
+
+    // — Queue rail ————————————————————————————————————————————————
+
+    fn view_queue(&self) -> Element<'_, Message> {
+        let rows = self.app.queue_rows();
+        let mut col = column![
+            row![
+                text("Queue").font(style::font(700)).size(t::H3.size),
+                Space::new().width(Length::Fill).height(Length::Shrink),
+                button(icon(icons::CLOSE, 16.0, style::muted_fg()))
+                    .padding(6)
+                    .style(style::chip(false))
+                    .on_press(Message::QueueToggle),
+            ]
+            .align_y(alignment::Vertical::Center),
+        ]
+        .spacing(4);
+        col = col.push(Space::new().width(Length::Fill).height(Length::Fixed(8.0)));
+
+        let mut queue_col = column![].spacing(1);
+        let mut last_region: Option<Region> = None;
+        for (i, (id, region)) in rows.iter().enumerate() {
+            if region != &last_region.unwrap_or(Region::Played) {
+                if let Some(l) = match region {
+                    Region::Played => None,
+                    Region::Current => Some("NOW PLAYING"),
+                    Region::Manual => Some("NEXT IN QUEUE"),
+                    Region::Automatic => Some("NEXT UP"),
+                } {
+                    queue_col = queue_col.push(
+                        container(text(l).font(style::font(400)).size(11.0).style(style::text_muted()))
+                            .padding(Padding { top: 10.0, ..Padding::ZERO }),
+                    );
+                }
+                last_region = Some(*region);
+            }
+            let tv = self.app.library.track_view(*id);
+            let is_current = *region == Region::Current;
+            let mut r = row![
+                container(
+                    image(self.art(AppState::album_seed(tv.album_id), 32))
+                        .width(Length::Fixed(32.0))
+                        .height(Length::Fixed(32.0))
+                        .content_fit(iced::ContentFit::Cover)
+                )
+                .clip(true),
+                column![
+                    text(tv.title.to_string()).font(style::font(500)).size(t::SMALL.size + 1.0),
+                    text(tv.artist.to_string()).font(style::font(400)).size(t::SMALL.size).style(style::text_muted()),
+                ]
+                .spacing(1),
+                Space::new().width(Length::Fill).height(Length::Shrink),
+                text(mmss(tv.duration_sec)).font(style::font(400)).size(t::SMALL.size).style(style::text_muted()),
+            ]
+            .spacing(10)
+            .align_y(alignment::Vertical::Center);
+            if !is_current {
+                r = r.push(
+                    button(icon(icons::CLOSE, 13.0, style::muted_fg()))
+                        .padding(4)
+                        .style(style::chip(false))
+                        .on_press(Message::QueueRemove(i)),
+                );
+            }
+            queue_col = queue_col.push(
+                button(r)
+                    .width(Length::Fill)
+                    .padding(6)
+                    .style(style::row_button(is_current, false))
+                    .on_press(Message::QueueJump(i)),
+            );
+        }
+        col = col.push(
+            scrollable(queue_col)
+                .direction(scrollable::Direction::Vertical(
+                    scrollable::Scrollbar::new().width(4).scroller_width(4),
+                ))
+                .style(style::scrollable())
+                .height(Length::Fill),
+        );
+        container(col)
+            .width(Length::Fixed(t::QUEUE_W))
+            .height(Length::Fill)
+            .padding(Padding { top: 16.0, left: 16.0, right: 12.0, bottom: 12.0 })
+            .style(style::container_rail())
+            .into()
+    }
+
+    // — Player bar ———————————————————————————————————————————————
+
+    fn view_player_bar(&self) -> Element<'_, Message> {
+        let current = self.app.current_track();
+        let (title, artist, seed, album_id, artist_id, track_id, liked) = match current {
+            Some(track) => (
+                track.title.clone(),
+                self.app.library.artist(track.artist_id).name.clone(),
+                AppState::album_seed(track.album_id),
+                track.album_id,
+                track.artist_id,
+                track.id,
+                track.liked,
+            ),
+            None => ("Nothing playing".to_string(), "—".to_string(), 0, 0, 0, 0, false),
+        };
+        let has_track = current.is_some();
+        let position = self.app.player.position_sec();
+        let duration = self.app.player.duration_sec().max(1.0);
+        let playing = self.app.playing;
+
+        let info = row![
+            container(
+                image(self.art(seed, 40))
+                    .width(Length::Fixed(40.0))
+                    .height(Length::Fixed(40.0))
+                    .content_fit(iced::ContentFit::Cover)
+            )
+            .clip(true)
+            .style(style::container_art()),
+            column![
+                button(text(title).font(style::font(500)).size(t::BODY.size))
+                    .style(style::chip(false))
+                    .on_press(Message::OpenAlbum(album_id)),
+                button(text(artist).font(style::font(400)).size(t::SMALL.size).style(style::text_muted()))
+                    .style(style::chip(false))
+                    .on_press(Message::OpenArtist(artist_id)),
+            ]
+            .spacing(1),
+        ]
+        .spacing(12)
+        .align_y(alignment::Vertical::Center);
+
+        let transport = row![
+            button(icon(icons::SHUFFLE, 18.0, if self.app.shuffle { style::primary() } else { style::muted_fg() }))
+                .padding(6)
+                .style(style::chip(self.app.shuffle))
+                .on_press(Message::ToggleShuffle),
+            button(icon(icons::PREV, 20.0, style::fg()))
+                .padding(6)
+                .style(style::chip(false))
+                .on_press(Message::Previous),
+            button(
+                container(icon(if playing { icons::PAUSE } else { icons::PLAY }, 22.0, Color::WHITE))
+                    .width(Length::Fixed(40.0))
+                    .height(Length::Fixed(40.0))
+                    .align_x(alignment::Horizontal::Center)
+                    .align_y(alignment::Vertical::Center),
+            )
+            .style(style::primary_pill())
+            .on_press(Message::TogglePlay),
+            button(icon(icons::NEXT, 20.0, style::fg()))
+                .padding(6)
+                .style(style::chip(false))
+                .on_press(Message::Next),
+            button(icon(
+                match self.app.repeat { RepeatMode::One => icons::REPEAT_ONE, _ => icons::REPEAT },
+                18.0,
+                if self.app.repeat != RepeatMode::Off { style::primary() } else { style::muted_fg() },
+            ))
+            .padding(6)
+            .style(style::chip(self.app.repeat != RepeatMode::Off))
+            .on_press(Message::CycleRepeat),
+        ]
+        .spacing(6)
+        .align_y(alignment::Vertical::Center);
+
+        let seek = row![
+            text(mmss(position as u32))
+                .font(style::font(400))
+                .size(t::SMALL.size)
+                .style(style::text_muted())
+                .width(Length::Fixed(36.0))
+                .align_x(alignment::Horizontal::Right),
+            container(
+                slider(0.0..=duration as f32, position.min(duration) as f32, Message::Seek)
+                    .style(style::slider()),
+            )
+            .width(Length::Fill)
+            .padding(Padding { top: 8.0, bottom: 8.0, ..Padding::ZERO }),
+            text(mmss(duration as u32))
+                .font(style::font(400))
+                .size(t::SMALL.size)
+                .style(style::text_muted())
+                .width(Length::Fixed(36.0)),
+        ]
+        .spacing(10)
+        .align_y(alignment::Vertical::Center);
+
+        let volume_icon = if self.app.muted || self.app.volume < 0.01 { icons::VOLUME_MUTE } else { icons::VOLUME };
+        let right = row![
+            button(icon(if liked { icons::HEART_ACTIVE } else { icons::HEART }, 18.0, if liked { style::primary() } else { style::muted_fg() }))
+                .padding(6)
+                .style(style::chip(liked))
+                .on_press(if has_track { Message::ToggleLike(track_id) } else { Message::Tick }),
+            button(icon(icons::QUEUE, 18.0, if self.queue_open { style::primary() } else { style::muted_fg() }))
+                .padding(6)
+                .style(style::chip(self.queue_open))
+                .on_press(Message::QueueToggle),
+            button(icon(volume_icon, 18.0, style::muted_fg()))
+                .padding(6)
+                .style(style::chip(false))
+                .on_press(Message::ToggleMute),
+            container(
+                slider(0.0..=100.0, if self.app.muted { 0.0 } else { self.app.volume * 100.0 }, Message::SetVolume)
+                    .style(style::slider()),
+            )
+            .width(Length::Fixed(96.0))
+            .padding(Padding { top: 8.0, bottom: 8.0, ..Padding::ZERO }),
+        ]
+        .spacing(4)
+        .align_y(alignment::Vertical::Center);
+
+        let bar = row![
+            container(info).width(Length::FillPortion(10)).align_x(alignment::Horizontal::Left),
+            container(
+                column![transport, container(seek).width(Length::Fixed(340.0))]
+                    .spacing(4)
+                    .align_x(alignment::Horizontal::Center),
+            )
+            .align_x(alignment::Horizontal::Center),
+            container(right).width(Length::FillPortion(10)).align_x(alignment::Horizontal::Right),
+        ]
+        .align_y(alignment::Vertical::Center)
+        .padding(Padding { left: 16.0, right: 16.0, top: 10.0, bottom: 12.0 });
+        container(bar).width(Length::Fill).style(style::container_bg()).into()
+    }
+
+    // — Track row (lazy-cached; used by every list) ————————————
+
+    pub fn track_row(&self, index: usize, id: TrackId, list: &[TrackId]) -> Element<'_, Message> {
+        let playing_here = self.app.current == Some(id) && self.app.playing;
+        let is_current = self.app.current == Some(id);
+        let selected = self.app.selection == Some(index);
+        let liked = self.app.library.track(id).liked;
+        let explicit = self.app.library.track(id).explicit;
+        let frame_key = if playing_here { self.frame } else { 0 };
+        let list = list.to_vec();
+
+        lazy(
+            (id, index as u32, playing_here, is_current, selected, liked, explicit, frame_key),
+            move |_| {
+                let v = self.app.library.track_view(id);
+                let art_seed = AppState::album_seed(v.album_id);
+
+                let index_cell: Element<'_, Message> = if is_current {
+                    if playing_here {
+                        canvas::Canvas::new(BarsProgram { frame: self.frame })
+                            .width(Length::Fixed(18.0))
+                            .height(Length::Fixed(14.0))
+                            .into()
+                    } else {
+                        container(icon(icons::PLAY, 14.0, style::primary())).width(Length::Fixed(18.0)).into()
+                    }
+                } else {
+                    container(text(format!("{:3}", index + 1)).font(style::font(400)).size(t::SMALL.size).style(style::text_muted()))
+                        .width(Length::Fixed(24.0))
+                        .align_x(alignment::Horizontal::Right)
+                        .into()
+                };
+
+                let mut title_row = row![text(v.title.to_string()).font(style::font(500)).size(t::BODY.size)]
+                    .spacing(6)
+                    .align_y(alignment::Vertical::Center);
+                if explicit {
+                    title_row = title_row.push(
+                        container(text("E").font(style::font(700)).size(9.0).style(style::text_muted()))
+                            .width(Length::Fixed(14.0))
+                            .height(Length::Fixed(14.0))
+                            .align_x(alignment::Horizontal::Center)
+                            .align_y(alignment::Vertical::Center)
+                            .style(style::container_badge()),
+                    );
+                }
+
+                let info = column![title_row, text(v.artist.to_string()).font(style::font(400)).size(t::SMALL.size).style(style::text_muted())]
+                    .spacing(2)
+                    .width(Length::Fill);
+
+                let right: Element<'_, Message> = if liked {
+                    container(icon(icons::HEART_ACTIVE, 14.0, style::primary())).width(Length::Fixed(18.0)).into()
+                } else {
+                    container(text(mmss(v.duration_sec)).font(style::font(400)).size(t::SMALL.size).style(style::text_muted()))
+                        .width(Length::Fixed(36.0))
+                        .align_x(alignment::Horizontal::Right)
+                        .into()
+                };
+
+                let content = row![
+                    index_cell,
+                    container(
+                        image(self.art(art_seed, 40))
+                            .width(Length::Fixed(40.0))
+                            .height(Length::Fixed(40.0))
+                            .content_fit(iced::ContentFit::Cover),
+                    )
+                    .clip(true)
+                    .style(style::container_art()),
+                    info,
+                    right,
+                ]
+                .spacing(12)
+                .align_y(alignment::Vertical::Center)
+                .height(Length::Fixed(t::ROW_H - 6.0));
+
+                let row_button: iced::widget::Button<'_, Message> = button(content)
+                    .width(Length::Fill)
+                    .padding(Padding::new(3.0))
+                    .style(style::row_button(is_current, selected))
+                    .on_press(Message::PlayFrom(list.clone(), index));
+                let el: Element<'_, Message> = row_button.into();
+                el
+            },
+        )
+        .into()
+    }
+}
+
+// — Page header / pill / nav helpers (free fns — closures with elided
+//    reference params fail lifetime checks inside the view methods) ———
+
+pub fn page_header<'a>(title: &str, can_back: bool) -> Element<'a, Message> {
+    let mut h = row![].spacing(12).align_y(alignment::Vertical::Center);
+    if can_back {
+        h = h.push(
+            button(icon(icons::BACK, 20.0, style::muted_fg()))
+                .padding(8)
+                .style(style::chip(false))
+                .on_press(Message::Back),
+        );
+    }
+    h = h.push(style::h1(title));
+    h.into()
+}
+
+pub fn nav_item<'a>(label: &str, icon_bytes: &'static [u8], active: bool, msg: Message) -> Element<'a, Message> {
+    button(
+        row![
+            icon(icon_bytes, 19.0, if active { style::fg() } else { style::muted_fg() }),
+            text(label.to_string())
+                .font(style::font(500))
+                .size(t::BODY.size)
+                .style(style::text_active(active)),
+        ]
+        .spacing(12)
+        .align_y(alignment::Vertical::Center),
+    )
+    .width(Length::Fill)
+    .height(Length::Fixed(36.0))
+    .padding(Padding { left: 12.0, ..Padding::ZERO })
+    .style(style::nav_button(active, false))
+    .on_press(msg)
+    .into()
+}
+
+pub fn tab_button<'a>(label: &str, tab: LibraryTab, active: bool) -> Element<'a, Message> {
+    button(text(label.to_string()).font(style::font(500)).size(t::SMALL.size + 1.0))
+        .padding(Padding { left: 14.0, right: 14.0, top: 6.0, bottom: 6.0 })
+        .style(style::tab_pill(active))
+        .on_press(Message::LibraryTab(tab))
+        .into()
+}
+
+pub fn setting_row<'a>(label: &str, value: &str) -> Element<'a, Message> {
+    container(
+        row![
+            text(label.to_string()).font(style::font(500)).size(t::BODY.size),
+            Space::new().width(Length::Fill).height(Length::Shrink),
+            text(value.to_string()).font(style::font(400)).size(t::SMALL.size).style(style::text_muted()),
+        ]
+        .align_y(alignment::Vertical::Center),
+    )
+    .width(Length::Fill)
+    .padding(Padding { left: 14.0, right: 14.0, top: 11.0, bottom: 11.0 })
+    .style(style::container_setting())
+    .into()
+}
+
+pub fn settings_section<'a>(title: &str, rows: Vec<Element<'a, Message>>) -> Element<'a, Message> {
+    column![style::h2(title)]
+        .spacing(10)
+        .push(column(rows).spacing(6))
+        .spacing(14)
+        .into()
+}
+
+pub fn page_scroll(body: Element<'_, Message>) -> Element<'_, Message> {
+    scrollable(body)
+        .id(PAGE_SCROLL)
+        .direction(scrollable::Direction::Vertical(
+            scrollable::Scrollbar::new().width(4).scroller_width(4),
+        ))
+        .style(style::scrollable())
+        .height(Length::Fill)
+        .width(Length::Fill)
+        .into()
+}
+
+pub fn shelf<'a>(title: &str, cards: Vec<Element<'a, Message>>) -> Element<'a, Message> {
+    let mut scroller = row![].spacing(16);
+    for c in cards {
+        scroller = scroller.push(c);
+    }
+    column![
+        style::h2(title),
+        scrollable(scroller)
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::new().width(4).scroller_width(4)
+            ))
+            .style(style::scrollable())
+            .width(Length::Fill),
+    ]
+    .spacing(12)
+    .into()
+}
+
+pub fn primary_pill<'a>(label: &str, icon_bytes: &'static [u8], msg: Message) -> Element<'a, Message> {
+    button(
+        row![
+            icon(icon_bytes, 18.0, Color::WHITE),
+            text(label.to_string()).font(style::font(500)).size(t::BODY.size),
+        ]
+        .spacing(8)
+        .align_y(alignment::Vertical::Center),
+    )
+    .padding(Padding { left: 20.0, right: 20.0, top: 9.0, bottom: 9.0 })
+    .style(style::primary_pill())
+    .on_press(msg)
+    .into()
+}
+
+pub fn ghost_pill<'a>(label: &str, icon_bytes: &'static [u8], msg: Message) -> Element<'a, Message> {
+    button(
+        row![
+            icon(icon_bytes, 18.0, style::fg()),
+            text(label.to_string()).font(style::font(500)).size(t::BODY.size),
+        ]
+        .spacing(8)
+        .align_y(alignment::Vertical::Center),
+    )
+    .padding(Padding { left: 18.0, right: 18.0, top: 9.0, bottom: 9.0 })
+    .style(style::pill_ghost())
+    .on_press(msg)
+    .into()
+}
+
+// — Keyboard ————————————————————————————————————————————————————
+
+fn keyboard_event(event: iced::keyboard::Event) -> Option<Message> {
+    let iced::keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
+        return None;
+    };
+    use iced::keyboard::Key;
+    let ctrl = modifiers.control() || modifiers.logo();
+    match key {
+        Key::Character(ref c) if ctrl && (c == "k" || c == "K") => Some(Message::FocusSearch),
+        Key::Named(Named::Space) if !ctrl => Some(Message::TogglePlay),
+        Key::Named(Named::Escape) => Some(Message::Escape),
+        Key::Named(Named::ArrowRight) if !ctrl => Some(Message::SeekDelta(10.0)),
+        Key::Named(Named::ArrowLeft) if !ctrl => Some(Message::SeekDelta(-10.0)),
+        Key::Character(ref c) if !ctrl && (c == "m" || c == "M") => Some(Message::ToggleMute),
+        Key::Character(ref c) if !ctrl && (c == "q" || c == "Q") => Some(Message::QueueToggle),
+        Key::Character(ref c) if !ctrl && (c == "s" || c == "S") => Some(Message::ToggleShuffle),
+        Key::Character(ref c) if !ctrl && (c == "r" || c == "R") => Some(Message::CycleRepeat),
+        _ => None,
+    }
+}
+
+fn scroll_to_frac(id: &'static str, frac: f32) -> Task<Message> {
+    iced::widget::operation::snap_to(
+        id,
+        iced::widget::operation::RelativeOffset { x: 0.0, y: frac },
+    )
+}
+
+// — Bars canvas (the now-playing indicator) ———————————————————
+
+pub struct BarsProgram {
+    pub frame: u64,
+}
+
+impl canvas::Program<Message> for BarsProgram {
+    type State = ();
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &iced::Renderer,
+        _theme: &iced::Theme,
+        bounds: Rectangle,
+        _cursor: iced::mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let f = self.frame as f32 * 0.12;
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        for i in 0..3 {
+            let phase = f + i as f32 * 0.9;
+            let h = (phase.sin() * 0.5 + 0.5) * 0.85 + 0.15;
+            let bar_h = bounds.height * h;
+            frame.fill_rectangle(
+                iced::Point::new(bounds.x + i as f32 * 6.0, bounds.y + (bounds.height - bar_h)),
+                iced::Size::new(4.0, bar_h),
+                style::primary(),
+            );
+        }
+        vec![frame.into_geometry()]
+    }
+}
+
+// — Icon helper ——————————————————————————————————————————————
+
+pub fn icon(bytes: &'static [u8], size: f32, color: Color) -> svg::Svg<'static> {
+    svg(icons::handle(bytes))
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size))
+        .style(move |_t: &iced::Theme, _s| svg::Style { color: Some(color) })
+}
