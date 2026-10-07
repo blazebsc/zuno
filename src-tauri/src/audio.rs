@@ -21,6 +21,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use rodio::cpal::StreamError;
 use rodio::stream::{DeviceSinkBuilder, MixerDeviceSink};
 use rodio::{DeviceTrait, Player, Source};
 use serde::Serialize;
@@ -43,6 +44,10 @@ const FADE_STEP: Duration = Duration::from_millis(20);
 const READ_TIMEOUT: Duration = Duration::from_secs(20);
 /// Poll interval while waiting on the download. Short enough to be inaudible.
 const READ_POLL: Duration = Duration::from_millis(10);
+
+/// A stream that dies sooner than this after opening is a device that will not come back by
+/// reopening it, so loads refuse for this long instead of walking the queue through it.
+const STREAM_RETRY_WINDOW: Duration = Duration::from_secs(10);
 
 /// A decoded stream ready to be handed to a deck. rodio resamples it to the device's rate.
 pub(crate) type BoxedSource = Box<dyn Source + Send>;
@@ -266,6 +271,8 @@ pub(crate) enum Command {
         reply: Sender<bool>,
     },
     DropStandby,
+    /// The output stream of this generation died. Sent by the stream's own error callback.
+    StreamFailed(u64),
     /// Stops and clears the active deck only, leaving the standby deck untouched.
     ///
     /// The narrow counterpart to `DropStandby`, and the one a cancelled *load* needs: `Stop`
@@ -307,6 +314,7 @@ impl NativeAudio {
             let (tx, rx) = mpsc::channel();
             let (ready_tx, ready_rx) = mpsc::channel();
             let app = self.app.clone();
+            let commands = tx.clone();
             let device = self
                 .pending_device
                 .lock()
@@ -314,7 +322,7 @@ impl NativeAudio {
                 .clone();
             std::thread::Builder::new()
                 .name("zuno-audio".into())
-                .spawn(move || run(app, rx, ready_tx, device))
+                .spawn(move || run(app, rx, commands, ready_tx, device))
                 .map_err(|error| format!("audio thread failed to start: {error}"))?;
 
             ready_rx
@@ -557,11 +565,13 @@ fn our_sink_input_id() -> Option<u64> {
  * stored preference from weeks ago turning into silence the user has to notice and go fix in
  * settings, which is a worse failure than picking a device for them.
  */
-fn open_device_sink(id: Option<&str>) -> Result<MixerDeviceSink, String> {
+fn open_device_sink(
+    id: Option<&str>,
+    on_error: impl FnMut(StreamError) + Send + 'static,
+) -> Result<MixerDeviceSink, String> {
     #[cfg(target_os = "linux")]
     if let Some(sink_name) = id.and_then(|id| id.strip_prefix(PIPEWIRE_SINK_ID_PREFIX)) {
-        let stream = DeviceSinkBuilder::open_default_sink()
-            .map_err(|error| format!("no audio output device: {error}"))?;
+        let stream = open_default_sink(on_error)?;
         move_our_stream_to_pipewire_sink(sink_name);
         return Ok(stream);
     }
@@ -579,11 +589,55 @@ fn open_device_sink(id: Option<&str>) -> Result<MixerDeviceSink, String> {
 
     match device {
         Some(device) => DeviceSinkBuilder::from_device(device)
-            .and_then(DeviceSinkBuilder::open_stream)
+            .and_then(|builder| builder.with_error_callback(on_error).open_stream())
             .map_err(|error| format!("failed to open audio output device: {error}")),
-        None => DeviceSinkBuilder::open_default_sink()
-            .map_err(|error| format!("no audio output device: {error}")),
+        None => open_default_sink(on_error),
     }
+}
+
+// ponytail: rodio's fallback to another device keeps its own logging callback, so a stream on
+// a fallback device is not recovered. Reimplement `open_default_sink` if that ever matters.
+fn open_default_sink(
+    on_error: impl FnMut(StreamError) + Send + 'static,
+) -> Result<MixerDeviceSink, String> {
+    DeviceSinkBuilder::from_default_device()
+        .and_then(|builder| builder.with_error_callback(on_error).open_stream())
+        .or_else(|_| DeviceSinkBuilder::open_default_sink())
+        .map_err(|error| format!("no audio output device: {error}"))
+}
+
+fn stream_failure_reporter(
+    commands: Sender<Command>,
+    generation: u64,
+) -> impl FnMut(StreamError) + Send + 'static {
+    let mut reported = false;
+    move |error| {
+        // cpal recovers underruns itself. Anything else leaves the stream dead, and on ALSA it
+        // reports that POLLERR in a tight loop until the stream is dropped (#154).
+        if matches!(error, StreamError::BufferUnderrun) || reported {
+            return;
+        }
+        reported = true;
+        eprintln!("[internal][tauri][warn] native_audio stream failed: {error}");
+        let _ = commands.send(Command::StreamFailed(generation));
+    }
+}
+
+/// Opens `id` with two fresh, paused decks on it. The stream reports its own death once, as
+/// `StreamFailed(generation)`.
+fn open_output(
+    id: Option<&str>,
+    commands: Sender<Command>,
+    generation: u64,
+) -> Result<(MixerDeviceSink, [Deck; 2]), String> {
+    let stream = open_device_sink(id, stream_failure_reporter(commands, generation))?;
+    let deck = || {
+        let sink = Player::connect_new(stream.mixer());
+        sink.pause();
+        Deck { sink, track_id: None, duration_sec: 0.0, health: None }
+    };
+    let decks = [deck(), deck()];
+    Ok((stream, decks))
 }
 
 fn find_output_device(id: &str) -> Option<rodio::Device> {
@@ -609,37 +663,27 @@ pub(crate) fn request<T>(
 fn run(
     app: AppHandle,
     rx: Receiver<Command>,
+    commands: Sender<Command>,
     ready: Sender<Result<(), String>>,
     initial_device: Option<String>,
 ) {
-    let stream = match open_device_sink(initial_device.as_deref()) {
-        Ok(stream) => stream,
+    let (stream, decks) = match open_output(initial_device.as_deref(), commands.clone(), 0) {
+        Ok(output) => output,
         Err(error) => {
             let _ = ready.send(Err(error));
             return;
         }
     };
-    let decks = [
-        Deck {
-            sink: Player::connect_new(stream.mixer()),
-            track_id: None,
-            duration_sec: 0.0,
-            health: None,
-        },
-        Deck {
-            sink: Player::connect_new(stream.mixer()),
-            track_id: None,
-            duration_sec: 0.0,
-            health: None,
-        },
-    ];
-    for deck in &decks {
-        deck.sink.pause();
-    }
 
     let mut engine = Engine {
         app,
-        _stream: stream,
+        stream: Some(stream),
+        device_id: initial_device,
+        commands,
+        generation: 0,
+        opened_at: Instant::now(),
+        reopen_after: None,
+        lost_track: None,
         decks,
         active: 0,
         volume: 1.0,
@@ -682,7 +726,19 @@ fn run(
 struct Engine {
     app: AppHandle,
     /// Dropping this closes the output device, so it outlives every deck connected to it.
-    _stream: MixerDeviceSink,
+    /// `None` once it has died, until the next load reopens it.
+    stream: Option<MixerDeviceSink>,
+    /// What to reopen, `None` for the OS default.
+    device_id: Option<String>,
+    /// Handed to each stream's error callback, the way back onto this thread.
+    commands: Sender<Command>,
+    /// Bumped per stream, so a late error from a replaced stream is ignored.
+    generation: u64,
+    opened_at: Instant,
+    /// Loads refuse to reopen before this; see `STREAM_RETRY_WINDOW`.
+    reopen_after: Option<Instant>,
+    /// The track a paused deck lost with its stream, handed back for a reload on the next play.
+    lost_track: Option<String>,
     decks: [Deck; 2],
     active: usize,
     volume: f32,
@@ -717,6 +773,18 @@ impl Engine {
                 health,
                 reply,
             } => {
+                if self.stream.is_none() {
+                    let reopened = if self.reopen_after.is_some_and(|at| Instant::now() < at) {
+                        Err("Audio output keeps failing. Try another output device or audio engine."
+                            .to_string())
+                    } else {
+                        self.reopen(self.device_id.clone())
+                    };
+                    if let Err(error) = reopened {
+                        let _ = reply.send(Err(error));
+                        return false;
+                    }
+                }
                 let index = if standby { self.standby() } else { self.active };
                 if !standby {
                     // A fade against a deck that is being reloaded would ramp a track that is
@@ -752,6 +820,14 @@ impl Engine {
                 let _ = reply.send(Ok(duration));
             }
             Command::Play(reply) => {
+                // Paused when its stream died: handed back as an early end, which reloads it.
+                if self.decks[self.active].track_id.is_none() {
+                    if let Some(track_id) = self.lost_track.take() {
+                        let _ = self.app.emit("native-audio-ended", EndedEvent { track_id });
+                        let _ = reply.send(Ok(()));
+                        return false;
+                    }
+                }
                 /*
                  * A crossfade already started this deck and owns its volume. The player calls
                  * `play` right after a transition to take the claim, and writing full volume
@@ -878,41 +954,52 @@ impl Engine {
                 self.decks[self.active].clear();
                 self.playing = false;
             }
-            Command::SetOutputDevice { id, reply } => match open_device_sink(id.as_deref()) {
-                Ok(stream) => {
-                    let decks = [
-                        Deck {
-                            sink: Player::connect_new(stream.mixer()),
-                            track_id: None,
-                            duration_sec: 0.0,
-                            health: None,
-                        },
-                        Deck {
-                            sink: Player::connect_new(stream.mixer()),
-                            track_id: None,
-                            duration_sec: 0.0,
-                            health: None,
-                        },
-                    ];
-                    for deck in &decks {
-                        deck.sink.pause();
+            Command::SetOutputDevice { id, reply } => {
+                let _ = reply.send(self.reopen(id));
+            }
+            Command::StreamFailed(generation) => {
+                if generation != self.generation || self.stream.is_none() {
+                    return false;
+                }
+                // Dropping it is what ends cpal's loop on the dead device.
+                self.stream = None;
+                self.fade = None;
+                if self.opened_at.elapsed() < STREAM_RETRY_WINDOW {
+                    self.reopen_after = Some(Instant::now() + STREAM_RETRY_WINDOW);
+                }
+                let lost = self.decks[self.active].track_id.clone();
+                for deck in &mut self.decks {
+                    deck.clear();
+                }
+                match lost {
+                    // An early end is what the player already reloads from, at the same position.
+                    Some(track_id) if self.playing => {
+                        let _ = self.app.emit("native-audio-ended", EndedEvent { track_id });
                     }
-                    // Both old decks go with the old stream, so a fade referencing them would
-                    // be stale — dropped rather than settled through `cancel_fade`, which would
-                    // write a volume to a deck this is about to discard anyway.
-                    self.fade = None;
-                    self._stream = stream;
-                    self.decks = decks;
-                    self.active = 0;
-                    self.playing = false;
-                    let _ = reply.send(Ok(()));
+                    lost => self.lost_track = lost,
                 }
-                Err(error) => {
-                    let _ = reply.send(Err(error));
-                }
-            },
+                self.playing = false;
+            }
         }
         false
+    }
+
+    /// Reopens the output on `id`. Both decks go with the old stream; the caller reloads.
+    fn reopen(&mut self, id: Option<String>) -> Result<(), String> {
+        let generation = self.generation + 1;
+        let (stream, decks) = open_output(id.as_deref(), self.commands.clone(), generation)?;
+        // A fade on the old decks is stale — dropped rather than settled through `cancel_fade`,
+        // which would write a volume to a deck this is about to discard anyway.
+        self.fade = None;
+        self.stream = Some(stream);
+        self.decks = decks;
+        self.device_id = id;
+        self.generation = generation;
+        self.opened_at = Instant::now();
+        self.lost_track = None;
+        self.active = 0;
+        self.playing = false;
+        Ok(())
     }
 
     fn cancel_fade(&mut self) {
@@ -977,5 +1064,30 @@ impl Engine {
                 duration_sec: self.decks[index].duration_sec,
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_failure_is_reported_once_and_underruns_never() {
+        let (tx, rx) = mpsc::channel();
+        let mut report = stream_failure_reporter(tx, 7);
+        let pollerr = || StreamError::BackendSpecific {
+            err: rodio::cpal::BackendSpecificError {
+                description: "`alsa::poll()` returned POLLERR".to_string(),
+            },
+        };
+
+        report(StreamError::BufferUnderrun);
+        assert!(rx.try_recv().is_err(), "an underrun is recovered by cpal, not by reopening");
+
+        for _ in 0..1000 {
+            report(pollerr());
+        }
+        assert!(matches!(rx.try_recv(), Ok(Command::StreamFailed(7))));
+        assert!(rx.try_recv().is_err(), "cpal repeats POLLERR in a loop; only the first counts");
     }
 }
