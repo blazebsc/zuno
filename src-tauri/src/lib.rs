@@ -1172,12 +1172,26 @@ fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<(), CommandEr
     let temp_path = path.with_extension("tmp");
     fs::write(&temp_path, bytes)
         .map_err(|error| cache_error(format!("cache write failed: {error}")))?;
-    if path.exists() {
-        fs::remove_file(path)
-            .map_err(|error| cache_error(format!("cache replacement failed: {error}")))?;
+    /*
+     * `rename` replaces the target on every platform, so the old file stays until the new one
+     * lands. Deleting it first meant a failed rename lost the whole settings file (#155).
+     *
+     * Retried because on Windows a virus scanner or the indexer often holds a just-written
+     * file for a moment, and the rename fails until it lets go.
+     */
+    let mut attempts = 0;
+    loop {
+        match fs::rename(&temp_path, path) {
+            Ok(()) => return Ok(()),
+            Err(_) if attempts < 10 => {
+                attempts += 1;
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => {
+                return Err(cache_error(format!("cache finalize failed: {error}")));
+            }
+        }
     }
-    fs::rename(&temp_path, path)
-        .map_err(|error| cache_error(format!("cache finalize failed: {error}")))
 }
 
 fn app_settings_path(app: &tauri::AppHandle) -> Result<PathBuf, CommandError> {
@@ -5579,6 +5593,21 @@ mod tests {
     use std::io::{Read, Seek, SeekFrom};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    // Replacing must not depend on deleting the old file first, or a failed save loses it (#155).
+    #[test]
+    fn write_json_file_replaces_an_existing_file() {
+        let dir = std::env::temp_dir().join(format!("zuno-write-json-{}", std::process::id()));
+        let path = dir.join("settings-v1.json");
+        assert!(super::write_json_file(&path, &HashMap::from([("minimize-to-tray", false)])).is_ok());
+        assert!(super::write_json_file(&path, &HashMap::from([("minimize-to-tray", true)])).is_ok());
+
+        let saved: HashMap<String, bool> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved.get("minimize-to-tray"), Some(&true));
+        assert!(!path.with_extension("tmp").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     // Every request goes through this builder; a root reqwest refuses would break all of them (#143).
     #[test]
