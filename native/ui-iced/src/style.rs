@@ -349,18 +349,15 @@ pub fn container_scrim() -> impl Fn(&iced::Theme) -> iced::widget::container::St
     }
 }
 
-/// Rounded-4 artwork tile wrapper.
-pub fn container_art() -> impl Fn(&iced::Theme) -> iced::widget::container::Style {
-    |_t: &iced::Theme| iced::widget::container::Style {
-        border: Border { radius: 4.0.into(), ..Default::default() },
-        ..Default::default()
-    }
-}
-
-/// Round (circle) artwork wrapper for artist photos.
-pub fn container_art_round() -> impl Fn(&iced::Theme) -> iced::widget::container::Style {
-    |_t: &iced::Theme| iced::widget::container::Style {
-        border: Border { radius: 116.0.into(), ..Default::default() },
+/// Artwork tile wrapper — 4px radius, or a full circle for artist photos.
+/// One named fn for both shapes: two distinct `impl Fn` returns never unify
+/// in an `if/else`.
+pub fn container_art_shape(round: bool) -> impl Fn(&iced::Theme) -> iced::widget::container::Style {
+    move |_t: &iced::Theme| iced::widget::container::Style {
+        border: Border {
+            radius: if round { Radius::from(116.0) } else { Radius::from(4.0) },
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -374,11 +371,18 @@ pub fn container_setting() -> impl Fn(&iced::Theme) -> iced::widget::container::
     }
 }
 
-/// The "E" explicit badge.
+/// The "E" explicit badge — `bg-muted-foreground/85`, dark glyph (React
+/// ExplicitBadge), 3px radius.
 pub fn container_badge() -> impl Fn(&iced::Theme) -> iced::widget::container::Style {
     |_t: &iced::Theme| iced::widget::container::Style {
-        background: Some(Background::Color(Color::from_rgba(1.0, 1.0, 1.0, 0.1))),
-        border: Border { radius: 2.0.into(), ..Default::default() },
+        background: Some(Background::Color(Color::from_rgba(
+            161.0 / 255.0,
+            161.0 / 255.0,
+            161.0 / 255.0,
+            0.85,
+        ))),
+        text_color: Some(background()),
+        border: Border { radius: 3.0.into(), ..Default::default() },
         ..Default::default()
     }
 }
@@ -418,6 +422,61 @@ pub fn input_search() -> impl Fn(&iced::Theme, iced::widget::text_input::Status)
             value: fg(),
             selection: primary(),
         }
+    }
+}
+
+// — Frameless shell / titlebar ————————————————————————————
+
+/// The app's rounded shell — the frameless window paints its own 14px-radius
+/// surface (the React app's `--window-radius: 14px`), square when maximized.
+pub fn shell(maximized: bool) -> impl Fn(&iced::Theme) -> iced::widget::container::Style {
+    move |_t: &iced::Theme| iced::widget::container::Style {
+        background: Some(Background::Color(background())),
+        text_color: Some(fg()),
+        border: Border {
+            radius: if maximized { Radius::from(0.0) } else { Radius::from(14.0) },
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// Titlebar window-control button. Hover = card surface; the close button
+/// hovers destructive-red with a white glyph (the React TitleBar convention).
+pub fn window_button(close: bool) -> impl Fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style {
+    move |_t: &iced::Theme, status: iced::widget::button::Status| {
+        let (bg, text) = match status {
+            iced::widget::button::Status::Hovered | iced::widget::button::Status::Pressed if close => {
+                (Color::from_rgb8(229, 72, 77), Color::WHITE)
+            }
+            iced::widget::button::Status::Hovered | iced::widget::button::Status::Pressed => {
+                (card(), fg())
+            }
+            _ => (Color::TRANSPARENT, muted_fg()),
+        };
+        iced::widget::button::Style {
+            background: Some(Background::Color(bg)),
+            text_color: text,
+            border: Border::default(),
+            ..Default::default()
+        }
+    }
+}
+
+/// `fg` when current, plain when not — one concrete type for both branches.
+pub fn text_current(current: bool) -> impl Fn(&iced::Theme) -> iced::widget::text::Style {
+    move |_t: &iced::Theme| iced::widget::text::Style {
+        color: Some(if current { primary() } else { fg() }),
+    }
+}
+
+/// Album-card outer surface — `hover:bg-card` on the whole card (React
+/// AlbumCard), transparent at rest.
+pub fn card_surface(hovered: bool) -> impl Fn(&iced::Theme) -> iced::widget::container::Style {
+    move |_t: &iced::Theme| iced::widget::container::Style {
+        background: Some(Background::Color(if hovered { card() } else { Color::TRANSPARENT })),
+        text_color: Some(fg()),
+        ..Default::default()
     }
 }
 

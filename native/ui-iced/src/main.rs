@@ -5,6 +5,12 @@
 //! same trade the React app makes with `content-visibility`. That is an
 //! honest part of the benchmark, recorded in the branch report.
 //!
+//! The window is frameless (`decorations(false)` + transparent surface):
+//! a custom 44px titlebar (wordmark, drag region, window controls), a 14px
+//! rounded shell painted by the app (square when maximized, like the React
+//! app's `html[data-window-maximized]`), and edge strips wired to winit's
+//! interactive resize via `window::drag_resize`.
+//!
 //! Every widget style comes from a named function in `style` — inline
 //! `move |_t| …` closures inside `column![]` macros defeat type inference.
 
@@ -16,12 +22,13 @@ use iced::widget::{
     button, canvas, column, container, image, lazy, mouse_area, row, scrollable, slider,
     stack, svg, text, text_input, Space,
 };
+use iced::widget::operation::AbsoluteOffset;
 use iced::{
     alignment, Color, Element, Length, Padding, Rectangle, Subscription, Task,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use zuno_core::bench::{BenchAction, BenchDriver};
 use zuno_core::format::{count_songs, counts_line, listeners, mmss};
 use zuno_core::model::*;
@@ -34,13 +41,36 @@ const SONGS_SCROLL: &str = "songs-scroll";
 const PAGE_SCROLL: &str = "page-scroll";
 const SEARCH_INPUT: &str = "search-input";
 
+/// Window/titlebar icon — `app-icon.png` pre-converted to 64×64 raw RGBA
+/// (committed at `assets/icon.rgba`, no build-time dependency needed).
+const ICON_W: u32 = 64;
+const ICON_RGBA: &[u8] = include_bytes!("../assets/icon.rgba");
+
+/// Two titlebar presses closer than this are a double-click (maximize), not a
+/// drag. iced's own click classification is roughly the same window.
+const DOUBLE_CLICK_MS: u64 = 400;
+
 fn main() -> iced::Result {
+    let icon = iced::window::icon::from_rgba(ICON_RGBA.to_vec(), ICON_W, ICON_W).ok();
     iced::application(Zuno::new, Zuno::update, Zuno::view)
         .title("Zuno")
         .theme(|_state: &Zuno| style::iced_theme())
         .font(include_bytes!("../assets/Inter-Variable.ttf"))
         .default_font(style::INTER)
-        .window_size((1280.0, 800.0))
+        .window(iced::window::Settings {
+            size: iced::Size::new(1280.0, 800.0),
+            min_size: Some(iced::Size::new(900.0, 600.0)),
+            decorations: false,
+            transparent: true,
+            icon,
+            ..iced::window::Settings::default()
+        })
+        // The window surface itself stays clear; the app paints its rounded
+        // shell (`style::shell`) so the corners can be truly transparent.
+        .style(|_state: &Zuno, _theme| iced::theme::Style {
+            background_color: Color::TRANSPARENT,
+            text_color: style::fg(),
+        })
         .subscription(Zuno::subscription)
         .run()
 }
@@ -48,11 +78,23 @@ fn main() -> iced::Result {
 #[derive(Clone, Debug)]
 pub enum Message {
     Tick,
-    Resized(f32),
+    Resized(f32, f32),
+    SetWindowId(iced::window::Id),
+    WindowMaximized(bool),
+    TitlebarPress,
+    TitlebarDoubleClick,
+    Minimize,
+    ToggleMaximize,
+    CloseWindow,
+    ResizeEdge(iced::window::Direction),
     Nav(View),
     LibraryTab(LibraryTab),
     SearchInput(String),
     FocusSearch,
+    SelectionStep(i32),
+    SelectionPlay,
+    PageScroll(f32),
+    RowHover(Option<usize>),
     OpenAlbum(AlbumId),
     OpenArtist(ArtistId),
     OpenPlaylist(PlaylistId),
@@ -80,10 +122,27 @@ pub enum Message {
 pub struct Zuno {
     pub app: AppState,
     pub handles: RefCell<HashMap<(u64, u32), image::Handle>>,
+    /// Titlebar logo, built once (re-rendering the bar every frame must not
+    /// re-decode the icon).
+    pub logo: image::Handle,
     pub hover_card: Option<u64>,
+    pub hover_row: Option<usize>,
     pub queue_open: bool,
     pub frame: u64,
     pub window_width: f32,
+    pub window_height: f32,
+    /// The single window's id, fetched with `window::latest()` at boot.
+    pub window_id: Option<iced::window::Id>,
+    pub maximized: bool,
+    /// Whether the search input holds keyboard focus, tracked by hand:
+    /// iced 0.14 has `operation::is_focused` (async) but no focus-change
+    /// event, so global shortcuts gate on this flag.
+    pub search_focused: bool,
+    /// Row count of the search results, maintained on keystrokes only (the
+    /// keyboard context needs the length without re-running the search every
+    /// subscription rebuild).
+    pub search_len: usize,
+    pub last_title_press: Option<Instant>,
     pub bench: Option<BenchDriver>,
 }
 
@@ -94,17 +153,39 @@ impl Zuno {
         } else {
             None
         };
+        let mut app = AppState::new();
+        // Screenshot helper: park on the Library ▸ Songs view (the 5,000-row
+        // surface) so an external `grim` can capture it without driving the UI.
+        if std::env::args().any(|a| a == "--screenshot-songs") {
+            app.view = View::Library;
+            app.library_tab = LibraryTab::Songs;
+        }
+        // Grab the window id at boot; every window action (drag, controls,
+        // resize edges) needs it. `latest()` is a oneshot resolved by the
+        // window manager once the window exists.
+        let boot = iced::window::latest().then(|id| match id {
+            Some(id) => Task::done(Message::SetWindowId(id)),
+            None => Task::none(),
+        });
         (
             Zuno {
-                app: AppState::new(),
+                app,
                 handles: RefCell::new(HashMap::new()),
+                logo: image::Handle::from_rgba(ICON_W, ICON_W, ICON_RGBA.to_vec()),
                 hover_card: None,
+                hover_row: None,
                 queue_open: false,
                 frame: 0,
                 window_width: 1280.0,
+                window_height: 800.0,
+                window_id: None,
+                maximized: false,
+                search_focused: false,
+                search_len: 0,
+                last_title_press: None,
                 bench,
             },
-            Task::none(),
+            boot,
         )
     }
 
@@ -134,18 +215,133 @@ impl Zuno {
                     }
                 }
             }
-            Message::Resized(w) => self.window_width = w,
-            Message::Nav(view) => self.app.go(view),
-            Message::LibraryTab(tab) => self.app.set_library_tab(tab),
-            Message::SearchInput(q) => self.app.set_search(&q),
+            Message::Resized(w, h) => {
+                self.window_width = w;
+                self.window_height = h;
+                if let Some(id) = self.window_id {
+                    return iced::window::is_maximized(id)
+                        .then(|m| Task::done(Message::WindowMaximized(m)));
+                }
+            }
+            Message::SetWindowId(id) => {
+                self.window_id = Some(id);
+                return iced::window::is_maximized(id)
+                    .then(|m| Task::done(Message::WindowMaximized(m)));
+            }
+            Message::WindowMaximized(maximized) => self.maximized = maximized,
+            Message::TitlebarPress => {
+                // Start an interactive drag — unless this press is the second
+                // half of a double-click, in which case the maximize toggle
+                // (TitlebarDoubleClick) handles it and dragging would fight it.
+                let now = Instant::now();
+                let is_double = self
+                    .last_title_press
+                    .map(|t| now.duration_since(t) < Duration::from_millis(DOUBLE_CLICK_MS))
+                    .unwrap_or(false);
+                self.last_title_press = Some(now);
+                if !is_double {
+                    if let Some(id) = self.window_id {
+                        return iced::window::drag(id);
+                    }
+                }
+            }
+            Message::TitlebarDoubleClick => {
+                if let Some(id) = self.window_id {
+                    return iced::window::toggle_maximize(id);
+                }
+            }
+            Message::Minimize => {
+                if let Some(id) = self.window_id {
+                    return iced::window::minimize(id, true);
+                }
+            }
+            Message::ToggleMaximize => {
+                if let Some(id) = self.window_id {
+                    return iced::window::toggle_maximize(id);
+                }
+            }
+            Message::CloseWindow => {
+                if let Some(id) = self.window_id {
+                    return iced::window::close(id);
+                }
+            }
+            Message::ResizeEdge(direction) => {
+                if let Some(id) = self.window_id {
+                    return iced::window::drag_resize(id, direction);
+                }
+            }
+            Message::Nav(view) => {
+                self.hover_row = None;
+                self.search_focused = false;
+                self.app.go(view);
+            }
+            Message::LibraryTab(tab) => {
+                self.hover_row = None;
+                self.app.set_library_tab(tab);
+            }
+            Message::SearchInput(q) => {
+                self.search_focused = true;
+                self.hover_row = None;
+                self.app.set_search(&q);
+                self.search_len =
+                    search::search(&self.app.library, &self.app.search_query).tracks.len();
+            }
             Message::FocusSearch => {
+                self.search_focused = true;
                 self.app.go(View::Search);
                 return iced::widget::operation::focus(SEARCH_INPUT);
             }
-            Message::OpenAlbum(id) => self.app.open_album(id),
-            Message::OpenArtist(id) => self.app.open_artist(id),
-            Message::OpenPlaylist(id) => self.app.open_playlist(id),
-            Message::PlayFrom(list, i) => self.app.play_from(&list, i),
+            Message::SelectionStep(delta) => {
+                let len = self.app.list_ids().len();
+                if len > 0 {
+                    let next = match self.app.selection {
+                        None if delta < 0 => len - 1,
+                        None => 0,
+                        Some(s) => (s as i32 + delta).clamp(0, len as i32 - 1) as usize,
+                    };
+                    self.app.selection = Some(next);
+                    return follow_selection(self.active_scroll_id(), next, self.window_height);
+                }
+            }
+            Message::SelectionPlay => {
+                if let Some(sel) = self.app.selection {
+                    let ids = self.app.list_ids();
+                    if sel < ids.len() {
+                        self.app.play_from(&ids, sel);
+                    }
+                }
+            }
+            Message::PageScroll(direction) => {
+                let viewport = list_viewport(self.window_height);
+                return iced::widget::operation::scroll_by(
+                    self.active_scroll_id(),
+                    AbsoluteOffset { x: 0.0, y: direction * viewport * 0.8 },
+                );
+            }
+            Message::RowHover(index) => self.hover_row = index,
+            Message::OpenAlbum(id) => {
+                self.hover_row = None;
+                self.search_focused = false;
+                self.app.open_album(id);
+            }
+            Message::OpenArtist(id) => {
+                self.hover_row = None;
+                self.search_focused = false;
+                self.app.open_artist(id);
+            }
+            Message::OpenPlaylist(id) => {
+                self.hover_row = None;
+                self.search_focused = false;
+                self.app.open_playlist(id);
+            }
+            Message::PlayFrom(list, i) => {
+                // Click-to-select: the clicked row is both selected (10% tint)
+                // and played, in the same handler.
+                if i < list.len() {
+                    self.app.selection = Some(i);
+                }
+                self.app.play_from(&list, i);
+            }
             Message::PlayShuffled(list) => {
                 self.app.play_from(&list, 0);
                 if !self.app.shuffle {
@@ -173,13 +369,21 @@ impl Zuno {
                 self.app.queue.remove_at(i);
             }
             Message::Back => {
+                self.hover_row = None;
+                self.search_focused = false;
                 self.app.go_back();
             }
             Message::CardHover(seed) => self.hover_card = seed,
             Message::Escape => {
                 if !self.app.search_query.is_empty() {
+                    // First Esc clears the query (the input keeps focus).
                     self.app.search_query.clear();
+                    self.search_len = 0;
                 } else {
+                    // Second Esc leaves the page; the input unmounts with it,
+                    // so the focus flag can honestly go false.
+                    self.search_focused = false;
+                    self.hover_row = None;
                     self.app.go_back();
                 }
             }
@@ -188,10 +392,18 @@ impl Zuno {
     }
 
     fn subscription(&self) -> Subscription<Message> {
+        let kb = KeyContext {
+            selection: self.app.selection,
+            list_len: self.list_len(),
+            search_focused: self.search_focused,
+        };
         Subscription::batch([
             iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick),
-            iced::window::resize_events().map(|(_id, size)| Message::Resized(size.width)),
-            iced::keyboard::listen().filter_map(keyboard_event),
+            iced::window::resize_events()
+                .map(|(_id, size)| Message::Resized(size.width, size.height)),
+            iced::keyboard::listen()
+                .with(kb)
+                .filter_map(|(kb, event)| keyboard_event(event, &kb)),
         ])
     }
 
@@ -206,6 +418,35 @@ impl Zuno {
             .clone()
     }
 
+    /// The scrollable that holds the current view's rows (cheap, no search
+    /// re-run) — used by keyboard selection-follow and PgUp/PgDn.
+    fn active_scroll_id(&self) -> &'static str {
+        if self.app.view == View::Library && self.app.library_tab == LibraryTab::Songs {
+            SONGS_SCROLL
+        } else {
+            PAGE_SCROLL
+        }
+    }
+
+    /// Row count of the current view's main list without materialising it.
+    fn list_len(&self) -> usize {
+        match &self.app.view {
+            View::Library if self.app.library_tab == LibraryTab::Songs => {
+                self.app.library.tracks.len()
+            }
+            View::Library => 0,
+            View::Album(id) => self.app.library.album(*id).track_ids.len(),
+            View::Playlist(id) => self
+                .app
+                .library
+                .playlist(*id)
+                .map(|p| p.track_ids.len())
+                .unwrap_or(0),
+            View::Search => self.search_len,
+            View::Home | View::Artist(_) | View::Settings => 0,
+        }
+    }
+
     // — Shell ———————————————————————————————————————————————————————
 
     fn view(&self) -> Element<'_, Message> {
@@ -215,19 +456,81 @@ impl Zuno {
             .height(Length::Fill)
             .style(style::container_bg());
         let middle = row![sidebar, content].height(Length::Fill);
-        let base = column![middle, self.view_player_bar()].spacing(0);
-        let page: Element<'_, Message> =
-            container(base).width(Length::Fill).height(Length::Fill).style(style::container_bg()).into();
+        let base = column![self.view_titlebar(), middle, self.view_player_bar()]
+            .spacing(0)
+            .height(Length::Fill);
+
+        // Stack order = z-order: queue rail above the page, resize strips
+        // above everything (they are 6/10px slivers at the window edge, where
+        // nothing else lives — page padding keeps interactive content clear).
+        let mut layers = stack![].width(Length::Fill).height(Length::Fill);
+        layers = layers.push(base);
         if self.queue_open {
-            let rail = container(self.view_queue())
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .align_x(alignment::Horizontal::Right)
-                .style(style::container_plain());
-            stack![page, rail].width(Length::Fill).height(Length::Fill).into()
-        } else {
-            page
+            layers = layers.push(
+                container(self.view_queue())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_x(alignment::Horizontal::Right)
+                    .style(style::container_plain()),
+            );
         }
+        for strip in resize_strips() {
+            layers = layers.push(strip);
+        }
+        // The rounded, clipped shell — the app paints the window's surface.
+        container(layers)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .clip(true)
+            .style(style::shell(self.maximized))
+            .into()
+    }
+
+    // — Titlebar (frameless window chrome) ————————————————————
+
+    fn view_titlebar(&self) -> Element<'_, Message> {
+        let brand = row![
+            image(self.logo.clone())
+                .width(Length::Fixed(22.0))
+                .height(Length::Fixed(22.0)),
+            text("zuno_")
+                .font(style::font(700))
+                .size(15.0)
+                .style(style::text_plain()),
+        ]
+        .spacing(9)
+        .align_y(alignment::Vertical::Center);
+
+        // The empty stretch of the bar: press = interactive drag, double
+        // press = maximize (the React TitleBar's drag region contract).
+        let drag = mouse_area(
+            container(Space::new().width(Length::Fill).height(Length::Fill))
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::TitlebarPress)
+        .on_double_click(Message::TitlebarDoubleClick)
+        .interaction(iced::mouse::Interaction::Grab);
+
+        let max_icon = if self.maximized { icons::RESTORE } else { icons::MAXIMIZE };
+        let controls = row![
+            window_button(icons::MINIMIZE, 15.0, Message::Minimize, false),
+            window_button(max_icon, 13.0, Message::ToggleMaximize, false),
+            window_button(icons::CLOSE, 14.0, Message::CloseWindow, true),
+        ];
+
+        let bar = row![
+            container(brand).padding(Padding { left: 16.0, ..Padding::ZERO }),
+            drag,
+            container(controls).padding(Padding { right: 8.0, ..Padding::ZERO }),
+        ]
+        .align_y(alignment::Vertical::Center)
+        .height(Length::Fixed(t::TITLEBAR_H));
+
+        container(bar)
+            .width(Length::Fill)
+            .height(Length::Fixed(t::TITLEBAR_H))
+            .into()
     }
 
     // — Sidebar ———————————————————————————————————————————————————————
@@ -284,13 +587,10 @@ impl Zuno {
                     .content_fit(iced::ContentFit::Cover)
             )
             .clip(true)
-            .style(style::container_art()),
+            .style(style::container_art_shape(false)),
             column![
-                text(p.title.as_str()).font(style::font(500)).size(t::SMALL.size + 1.0),
-                text(format!("{count} songs"))
-                    .font(style::font(400))
-                    .size(t::SMALL.size)
-                    .style(style::text_muted()),
+                text(p.title.as_str()).font(style::font(500)).size(t::BODY.size),
+                mono(format!("{count} songs")),
             ]
             .spacing(2),
         ]
@@ -305,7 +605,7 @@ impl Zuno {
             .into()
     }
 
-    // — Page router ————————————————————————————————————————————
+    // — Page router —————————————————————————————————————————————
 
     fn view_page(&self) -> Element<'_, Message> {
         match &self.app.view {
@@ -336,7 +636,7 @@ impl Zuno {
         }
     }
 
-    // — Home ———————————————————————————————————————————————————————
+    // — Home ————————————————————————————————————————————————————
 
     fn view_home(&self) -> Element<'_, Message> {
         let mut col = column![
@@ -368,6 +668,7 @@ impl Zuno {
                         m.title.clone(),
                         m.description.clone().unwrap_or_default(),
                         Message::OpenPlaylist(m.id),
+                        false,
                     )
                 })
                 .collect(),
@@ -391,31 +692,13 @@ impl Zuno {
                 .into_iter()
                 .map(|rid| {
                     let a = self.app.library.artist(rid);
-                    let art = self.art(AppState::artist_seed(rid), 176);
-                    mouse_area(
-                        container(
-                            column![
-                                container(
-                                    image(art)
-                                        .width(Length::Fixed(160.0))
-                                        .height(Length::Fixed(160.0))
-                                        .content_fit(iced::ContentFit::Cover)
-                                )
-                                .clip(true)
-                                .style(style::container_art_round()),
-                                Space::new().width(Length::Fill).height(Length::Fixed(6.0)),
-                                text(a.name.clone()).font(style::font(500)).size(t::BODY.size),
-                                text(listeners(a.monthly_listeners))
-                                    .font(style::font(400))
-                                    .size(t::SMALL.size)
-                                    .style(style::text_muted()),
-                            ]
-                            .spacing(4)
-                            .width(Length::Fixed(160.0)),
-                        ),
+                    self.generic_card(
+                        AppState::artist_seed(rid),
+                        a.name.clone(),
+                        listeners(a.monthly_listeners),
+                        Message::OpenArtist(rid),
+                        true,
                     )
-                    .on_press(Message::OpenArtist(rid))
-                    .into()
                 })
                 .collect(),
         ));
@@ -441,23 +724,27 @@ impl Zuno {
             album.title.clone(),
             format!("{} · {}", artist.name, album.year),
             Message::OpenAlbum(aid),
+            false,
         )
     }
 
-    /// AlbumCard from the spec: square art, hover scrim with a red play pill.
+    /// AlbumCard from the spec: square art (round for artists), hover card
+    /// surface + scrim with a red play pill.
     fn generic_card(
         &self,
         seed: u64,
         title: String,
         subtitle: String,
         on_open: Message,
+        art_round: bool,
     ) -> Element<'_, Message> {
         let hovered = self.hover_card == Some(seed);
         let art = image(self.art(seed, 176))
             .width(Length::Fixed(t::CARD_W))
             .height(Length::Fixed(t::CARD_W))
             .content_fit(iced::ContentFit::Cover);
-        let mut layers = stack![container(art).clip(true)];
+        let mut layers =
+            stack![container(art).clip(true).style(style::container_art_shape(art_round))];
         if hovered {
             layers = layers.push(
                 container(
@@ -479,9 +766,7 @@ impl Zuno {
             );
         }
         let card = column![
-            mouse_area(layers)
-                .on_enter(Message::CardHover(Some(seed)))
-                .on_exit(Message::CardHover(None)),
+            layers,
             Space::new().width(Length::Fill).height(Length::Fixed(8.0)),
             text(title).font(style::font(500)).size(t::BODY.size).width(Length::Fixed(t::CARD_W)),
             text(subtitle)
@@ -491,9 +776,18 @@ impl Zuno {
                 .width(Length::Fixed(t::CARD_W)),
         ]
         .spacing(2);
-        mouse_area(container(card).width(Length::Fixed(t::CARD_W + 8.0)))
-            .on_press(on_open)
-            .into()
+        // Hover surface on the whole card (React: `hover:bg-card`), hover
+        // tracking on the same area, click opens.
+        mouse_area(
+            container(card)
+                .width(Length::Fixed(t::CARD_W + 8.0))
+                .padding(Padding::new(0.0))
+                .style(style::card_surface(hovered)),
+        )
+        .on_enter(Message::CardHover(Some(seed)))
+        .on_exit(Message::CardHover(None))
+        .on_press(on_open)
+        .into()
     }
 
     // — Library (the 5,000-row large-list surface) ————————————
@@ -555,13 +849,10 @@ impl Zuno {
                                         .content_fit(iced::ContentFit::Cover)
                                 )
                                 .clip(true)
-                                .style(style::container_art_round()),
+                                .style(style::container_art_shape(true)),
                                 column![
                                     text(a.name.clone()).font(style::font(500)).size(t::BODY.size),
-                                    text(listeners(a.monthly_listeners))
-                                        .font(style::font(400))
-                                        .size(t::SMALL.size)
-                                        .style(style::text_muted()),
+                                    mono(listeners(a.monthly_listeners)),
                                 ]
                                 .spacing(2),
                                 Space::new().width(Length::Fill).height(Length::Shrink),
@@ -590,13 +881,10 @@ impl Zuno {
                                         .content_fit(iced::ContentFit::Cover)
                                 )
                                 .clip(true)
-                                .style(style::container_art()),
+                                .style(style::container_art_shape(false)),
                                 column![
                                     text(p.title.clone()).font(style::font(500)).size(t::BODY.size),
-                                    text(format!("{} · playlist", count_songs(p.track_ids.len())))
-                                        .font(style::font(400))
-                                        .size(t::SMALL.size)
-                                        .style(style::text_muted()),
+                                    mono(format!("{} · playlist", count_songs(p.track_ids.len()))),
                                 ]
                                 .spacing(2),
                                 Space::new().width(Length::Fill).height(Length::Shrink),
@@ -643,7 +931,7 @@ impl Zuno {
             column![
                 text(subtitle).font(style::font(400)).size(t::SMALL.size).style(style::text_muted()),
                 style::h1(&title),
-                text(counts).font(style::font(400)).size(t::SMALL.size).style(style::text_muted()),
+                mono(counts),
                 Space::new().width(Length::Fill).height(Length::Fill),
                 row![
                     primary_pill("Play", icons::PLAY, Message::PlayFrom(ids.clone(), 0)),
@@ -693,12 +981,12 @@ impl Zuno {
                     .content_fit(iced::ContentFit::Cover),
             )
             .clip(true)
-            .style(style::container_art_round()),
+            .style(style::container_art_shape(true)),
             column![
                 text("Artist").font(style::font(400)).size(t::SMALL.size).style(style::text_muted()),
                 style::h1(&a.name),
-                text(listeners(a.monthly_listeners)).font(style::font(400)).size(t::SMALL.size).style(style::text_muted()),
-                text(counts).font(style::font(400)).size(t::SMALL.size).style(style::text_muted()),
+                mono(listeners(a.monthly_listeners)),
+                mono(counts),
                 Space::new().width(Length::Fill).height(Length::Fill),
                 row![
                     primary_pill("Play", icons::PLAY, Message::PlayFrom(top.clone(), 0)),
@@ -772,6 +1060,7 @@ impl Zuno {
                         tv.title.to_string(),
                         format!("Song · {}", tv.artist),
                         Message::PlayTrack(top_id),
+                        false,
                     )],
                 ));
                 let ids = results.tracks.clone();
@@ -798,6 +1087,7 @@ impl Zuno {
                                     r.name.clone(),
                                     listeners(r.monthly_listeners),
                                     Message::OpenArtist(rid),
+                                    true,
                                 )
                             })
                             .collect(),
@@ -813,7 +1103,7 @@ impl Zuno {
         )
     }
 
-    // — Settings ————————————————————————————————————————————————————
+    // — Settings ————————————————————————————————————————————————
 
     fn view_settings(&self) -> Element<'_, Message> {
         let col = column![
@@ -844,7 +1134,7 @@ impl Zuno {
         )
     }
 
-    // — Queue rail ————————————————————————————————————————————————
+    // — Queue rail ————————————————————————————————————————————
 
     fn view_queue(&self) -> Element<'_, Message> {
         let rows = self.app.queue_rows();
@@ -881,6 +1171,20 @@ impl Zuno {
             }
             let tv = self.app.library.track_view(*id);
             let is_current = *region == Region::Current;
+            let playing = is_current && self.app.playing;
+            let right: Element<'_, Message> = if playing {
+                // The now-playing row trades its duration for the animated
+                // bars indicator (same glyph language as the track row).
+                canvas::Canvas::new(BarsProgram { frame: self.frame })
+                    .width(Length::Fixed(16.0))
+                    .height(Length::Fixed(14.0))
+                    .into()
+            } else {
+                container(mono(mmss(tv.duration_sec)))
+                    .width(Length::Fixed(36.0))
+                    .align_x(alignment::Horizontal::Right)
+                    .into()
+            };
             let mut r = row![
                 container(
                     image(self.art(AppState::album_seed(tv.album_id), 32))
@@ -890,12 +1194,15 @@ impl Zuno {
                 )
                 .clip(true),
                 column![
-                    text(tv.title.to_string()).font(style::font(500)).size(t::SMALL.size + 1.0),
+                    text(tv.title.to_string())
+                        .font(style::font(500))
+                        .size(t::SMALL.size + 1.0)
+                        .style(style::text_current(is_current)),
                     text(tv.artist.to_string()).font(style::font(400)).size(t::SMALL.size).style(style::text_muted()),
                 ]
                 .spacing(1),
                 Space::new().width(Length::Fill).height(Length::Shrink),
-                text(mmss(tv.duration_sec)).font(style::font(400)).size(t::SMALL.size).style(style::text_muted()),
+                right,
             ]
             .spacing(10)
             .align_y(alignment::Vertical::Center);
@@ -931,7 +1238,7 @@ impl Zuno {
             .into()
     }
 
-    // — Player bar ———————————————————————————————————————————————
+    // — Player bar ——————————————————————————————————————————————
 
     fn view_player_bar(&self) -> Element<'_, Message> {
         let current = self.app.current_track();
@@ -960,7 +1267,7 @@ impl Zuno {
                     .content_fit(iced::ContentFit::Cover)
             )
             .clip(true)
-            .style(style::container_art()),
+            .style(style::container_art_shape(false)),
             column![
                 button(text(title).font(style::font(500)).size(t::BODY.size))
                     .style(style::chip(false))
@@ -1009,10 +1316,7 @@ impl Zuno {
         .align_y(alignment::Vertical::Center);
 
         let seek = row![
-            text(mmss(position as u32))
-                .font(style::font(400))
-                .size(t::SMALL.size)
-                .style(style::text_muted())
+            mono(mmss(position as u32))
                 .width(Length::Fixed(36.0))
                 .align_x(alignment::Horizontal::Right),
             container(
@@ -1021,11 +1325,7 @@ impl Zuno {
             )
             .width(Length::Fill)
             .padding(Padding { top: 8.0, bottom: 8.0, ..Padding::ZERO }),
-            text(mmss(duration as u32))
-                .font(style::font(400))
-                .size(t::SMALL.size)
-                .style(style::text_muted())
-                .width(Length::Fixed(36.0)),
+            mono(mmss(duration as u32)).width(Length::Fixed(36.0)),
         ]
         .spacing(10)
         .align_y(alignment::Vertical::Center);
@@ -1069,23 +1369,29 @@ impl Zuno {
         container(bar).width(Length::Fill).style(style::container_bg()).into()
     }
 
-    // — Track row (lazy-cached; used by every list) ————————————
+    // — Track row (lazy-cached; used by every list) ——————————
 
     pub fn track_row(&self, index: usize, id: TrackId, list: &[TrackId]) -> Element<'_, Message> {
         let playing_here = self.app.current == Some(id) && self.app.playing;
         let is_current = self.app.current == Some(id);
         let selected = self.app.selection == Some(index);
+        // Row hover is mouse-driven only; the bench drives selection without
+        // a cursor, so keep its lazy-cache keys perfectly stable.
+        let hovered = self.hover_row == Some(index) && self.bench.is_none();
+        let bench_on = self.bench.is_some();
         let liked = self.app.library.track(id).liked;
         let explicit = self.app.library.track(id).explicit;
         let frame_key = if playing_here { self.frame } else { 0 };
         let list = list.to_vec();
 
         lazy(
-            (id, index as u32, playing_here, is_current, selected, liked, explicit, frame_key),
+            (id, index as u32, playing_here, is_current, selected, hovered, liked, explicit, frame_key),
             move |_| {
                 let v = self.app.library.track_view(id);
                 let art_seed = AppState::album_seed(v.album_id);
 
+                // The index slot: number → play glyph on hover → bars when
+                // this row is the one playing. One slot, no reflow.
                 let index_cell: Element<'_, Message> = if is_current {
                     if playing_here {
                         canvas::Canvas::new(BarsProgram { frame: self.frame })
@@ -1095,24 +1401,35 @@ impl Zuno {
                     } else {
                         container(icon(icons::PLAY, 14.0, style::primary())).width(Length::Fixed(18.0)).into()
                     }
+                } else if hovered {
+                    container(icon(icons::PLAY, 14.0, style::fg()))
+                        .width(Length::Fixed(18.0))
+                        .into()
                 } else {
-                    container(text(format!("{:3}", index + 1)).font(style::font(400)).size(t::SMALL.size).style(style::text_muted()))
+                    container(mono(format!("{:3}", index + 1)))
                         .width(Length::Fixed(24.0))
                         .align_x(alignment::Horizontal::Right)
                         .into()
                 };
 
-                let mut title_row = row![text(v.title.to_string()).font(style::font(500)).size(t::BODY.size)]
-                    .spacing(6)
-                    .align_y(alignment::Vertical::Center);
+                let mut title_row = row![
+                    text(v.title.to_string())
+                        .font(style::font(500))
+                        .size(t::BODY.size)
+                        .style(style::text_current(is_current))
+                ]
+                .spacing(6)
+                .align_y(alignment::Vertical::Center);
                 if explicit {
                     title_row = title_row.push(
-                        container(text("E").font(style::font(700)).size(9.0).style(style::text_muted()))
-                            .width(Length::Fixed(14.0))
-                            .height(Length::Fixed(14.0))
-                            .align_x(alignment::Horizontal::Center)
-                            .align_y(alignment::Vertical::Center)
-                            .style(style::container_badge()),
+                        container(
+                            text("E").font(style::font(700)).size(10.0),
+                        )
+                        .width(Length::Fixed(15.0))
+                        .height(Length::Fixed(15.0))
+                        .align_x(alignment::Horizontal::Center)
+                        .align_y(alignment::Vertical::Center)
+                        .style(style::container_badge()),
                     );
                 }
 
@@ -1123,7 +1440,7 @@ impl Zuno {
                 let right: Element<'_, Message> = if liked {
                     container(icon(icons::HEART_ACTIVE, 14.0, style::primary())).width(Length::Fixed(18.0)).into()
                 } else {
-                    container(text(mmss(v.duration_sec)).font(style::font(400)).size(t::SMALL.size).style(style::text_muted()))
+                    container(mono(mmss(v.duration_sec)))
                         .width(Length::Fixed(36.0))
                         .align_x(alignment::Horizontal::Right)
                         .into()
@@ -1138,7 +1455,7 @@ impl Zuno {
                             .content_fit(iced::ContentFit::Cover),
                     )
                     .clip(true)
-                    .style(style::container_art()),
+                    .style(style::container_art_shape(false)),
                     info,
                     right,
                 ]
@@ -1151,7 +1468,16 @@ impl Zuno {
                     .padding(Padding::new(3.0))
                     .style(style::row_button(is_current, selected))
                     .on_press(Message::PlayFrom(list.clone(), index));
-                let el: Element<'_, Message> = row_button.into();
+                // The annotation is load-bearing: it gives the if/else one
+                // concrete `Element<'_>` type (two `Into` targets never unify).
+                let el: Element<'_, Message> = if bench_on {
+                    row_button.into()
+                } else {
+                    mouse_area(row_button)
+                        .on_enter(Message::RowHover(Some(index)))
+                        .on_exit(Message::RowHover(None))
+                        .into()
+                };
                 el
             },
         )
@@ -1176,12 +1502,14 @@ pub fn page_header<'a>(title: &str, can_back: bool) -> Element<'a, Message> {
     h.into()
 }
 
+/// Sidebar nav item — active state is signalled by the card surface plus a
+/// weight bump (500 → 600), exactly one state signal per the spec.
 pub fn nav_item<'a>(label: &str, icon_bytes: &'static [u8], active: bool, msg: Message) -> Element<'a, Message> {
     button(
         row![
             icon(icon_bytes, 19.0, if active { style::fg() } else { style::muted_fg() }),
             text(label.to_string())
-                .font(style::font(500))
+                .font(style::font(if active { 600 } else { 500 }))
                 .size(t::BODY.size)
                 .style(style::text_active(active)),
         ]
@@ -1246,12 +1574,20 @@ pub fn shelf<'a>(title: &str, cards: Vec<Element<'a, Message>>) -> Element<'a, M
     }
     column![
         style::h2(title),
-        scrollable(scroller)
-            .direction(scrollable::Direction::Horizontal(
-                scrollable::Scrollbar::new().width(4).scroller_width(4)
-            ))
-            .style(style::scrollable())
-            .width(Length::Fill),
+        // Shelf breathing room under the card row — the hover surface
+        // extends past the art and must not sit flush against the next
+        // section's heading. (Scrollables take no padding; the container
+        // provides it.)
+        container(
+            scrollable(scroller)
+                .direction(scrollable::Direction::Horizontal(
+                    scrollable::Scrollbar::new().width(4).scroller_width(4)
+                ))
+                .style(style::scrollable())
+                .width(Length::Fill),
+        )
+        .padding(Padding { bottom: 12.0, ..Padding::ZERO })
+        .width(Length::Fill),
     ]
     .spacing(12)
     .into()
@@ -1287,32 +1623,138 @@ pub fn ghost_pill<'a>(label: &str, icon_bytes: &'static [u8], msg: Message) -> E
     .into()
 }
 
-// — Keyboard ————————————————————————————————————————————————————
+/// A 12px secondary figure — every duration, count and clock uses Advanced
+/// shaping (tabular figures) so timers never jitter the layout. Muted by
+/// design: every duration/count in the app is secondary text.
+pub fn mono<'a>(value: impl std::fmt::Display) -> iced::widget::Text<'a> {
+    text(value.to_string())
+        .font(style::font(400))
+        .size(t::SMALL.size)
+        .style(style::text_muted())
+        .shaping(iced::widget::text::Shaping::Advanced)
+}
 
-fn keyboard_event(event: iced::keyboard::Event) -> Option<Message> {
+// — Titlebar window controls / resize strips ————————————————————
+
+/// A minimal window-control button: muted glyph, card surface on hover,
+/// destructive red for the close button (React TitleBar convention).
+pub fn window_button<'a>(icon_bytes: &'static [u8], icon_size: f32, msg: Message, close: bool) -> Element<'a, Message> {
+    button(
+        container(icon(icon_bytes, icon_size, if close { Color::WHITE } else { style::muted_fg() }))
+            .width(Length::Fixed(44.0))
+            .height(Length::Fixed(30.0))
+            .align_x(alignment::Horizontal::Center)
+            .align_y(alignment::Vertical::Center),
+    )
+    .width(Length::Fixed(44.0))
+    .height(Length::Fixed(32.0))
+    .style(style::window_button(close))
+    .on_press(msg)
+    .into()
+}
+
+/// One invisible resize sliver pinned to a window edge, wired to winit's
+/// interactive resize. A frameless window has no server-drawn borders, so
+/// the app provides the 6/10px hit zones itself.
+fn resize_strip<'a>(
+    direction: iced::window::Direction,
+    width: Length,
+    height: Length,
+    horizontal: alignment::Horizontal,
+    vertical: alignment::Vertical,
+    interaction: iced::mouse::Interaction,
+) -> Element<'a, Message> {
+    container(
+        mouse_area(Space::new().width(width).height(height))
+            .on_press(Message::ResizeEdge(direction))
+            .interaction(interaction),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .align_x(horizontal)
+    .align_y(vertical)
+    .into()
+}
+
+fn resize_strips() -> Vec<Element<'static, Message>> {
+    use iced::window::Direction::*;
+    use iced::mouse::Interaction as I;
+    vec![
+        resize_strip(North, Length::Fill, Length::Fixed(6.0), alignment::Horizontal::Center, alignment::Vertical::Top, I::ResizingVertically),
+        resize_strip(South, Length::Fill, Length::Fixed(6.0), alignment::Horizontal::Center, alignment::Vertical::Bottom, I::ResizingVertically),
+        resize_strip(West, Length::Fixed(6.0), Length::Fill, alignment::Horizontal::Left, alignment::Vertical::Center, I::ResizingHorizontally),
+        resize_strip(East, Length::Fixed(6.0), Length::Fill, alignment::Horizontal::Right, alignment::Vertical::Center, I::ResizingHorizontally),
+        resize_strip(NorthWest, Length::Fixed(10.0), Length::Fixed(10.0), alignment::Horizontal::Left, alignment::Vertical::Top, I::ResizingDiagonallyUp),
+        resize_strip(NorthEast, Length::Fixed(10.0), Length::Fixed(10.0), alignment::Horizontal::Right, alignment::Vertical::Top, I::ResizingDiagonallyUp),
+        resize_strip(SouthWest, Length::Fixed(10.0), Length::Fixed(10.0), alignment::Horizontal::Left, alignment::Vertical::Bottom, I::ResizingDiagonallyDown),
+        resize_strip(SouthEast, Length::Fixed(10.0), Length::Fixed(10.0), alignment::Horizontal::Right, alignment::Vertical::Bottom, I::ResizingDiagonallyDown),
+    ]
+}
+
+// — Keyboard ————————————————————————————————————————————————
+
+/// What a global shortcut needs to know before it fires. Plain typing must
+/// reach the search field (and nothing else), so shortcuts gate on
+/// `search_focused`. Hashed into the subscription's identity via
+/// `Subscription::with` (mapper closures must be non-capturing).
+#[derive(Clone, Hash)]
+struct KeyContext {
+    selection: Option<usize>,
+    list_len: usize,
+    search_focused: bool,
+}
+
+fn keyboard_event(event: iced::keyboard::Event, kb: &KeyContext) -> Option<Message> {
     let iced::keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
         return None;
     };
     use iced::keyboard::Key;
     let ctrl = modifiers.control() || modifiers.logo();
+    let typing = kb.search_focused;
     match key {
         Key::Character(ref c) if ctrl && (c == "k" || c == "K") => Some(Message::FocusSearch),
-        Key::Named(Named::Space) if !ctrl => Some(Message::TogglePlay),
         Key::Named(Named::Escape) => Some(Message::Escape),
-        Key::Named(Named::ArrowRight) if !ctrl => Some(Message::SeekDelta(10.0)),
-        Key::Named(Named::ArrowLeft) if !ctrl => Some(Message::SeekDelta(-10.0)),
-        Key::Character(ref c) if !ctrl && (c == "m" || c == "M") => Some(Message::ToggleMute),
-        Key::Character(ref c) if !ctrl && (c == "q" || c == "Q") => Some(Message::QueueToggle),
-        Key::Character(ref c) if !ctrl && (c == "s" || c == "S") => Some(Message::ToggleShuffle),
-        Key::Character(ref c) if !ctrl && (c == "r" || c == "R") => Some(Message::CycleRepeat),
+        Key::Named(Named::Space) if !ctrl && !typing => Some(Message::TogglePlay),
+        Key::Named(Named::ArrowRight) if !ctrl && !typing => Some(Message::SeekDelta(10.0)),
+        Key::Named(Named::ArrowLeft) if !ctrl && !typing => Some(Message::SeekDelta(-10.0)),
+        Key::Named(Named::ArrowDown) if !ctrl && !typing && kb.list_len > 0 => Some(Message::SelectionStep(1)),
+        Key::Named(Named::ArrowUp) if !ctrl && !typing && kb.list_len > 0 => Some(Message::SelectionStep(-1)),
+        Key::Named(Named::PageDown) if !typing => Some(Message::PageScroll(1.0)),
+        Key::Named(Named::PageUp) if !typing => Some(Message::PageScroll(-1.0)),
+        Key::Named(Named::Enter) if !typing && kb.selection.is_some() => Some(Message::SelectionPlay),
+        Key::Character(ref c) if !ctrl && !typing && c == "/" => Some(Message::FocusSearch),
+        Key::Character(ref c) if !ctrl && !typing && (c == "m" || c == "M") => Some(Message::ToggleMute),
+        Key::Character(ref c) if !ctrl && !typing && (c == "q" || c == "Q") => Some(Message::QueueToggle),
+        Key::Character(ref c) if !ctrl && !typing && (c == "s" || c == "S") => Some(Message::ToggleShuffle),
+        Key::Character(ref c) if !ctrl && !typing && (c == "r" || c == "R") => Some(Message::CycleRepeat),
         _ => None,
     }
 }
+
+// — Scroll helpers ——————————————————————————————————————————
 
 fn scroll_to_frac(id: &'static str, frac: f32) -> Task<Message> {
     iced::widget::operation::snap_to(
         id,
         iced::widget::operation::RelativeOffset { x: 0.0, y: frac },
+    )
+}
+
+/// Estimated viewport height of the current list, for PgUp/PgDn and
+/// selection-follow. Frameworks with real anchors would not need this
+/// estimate; iced only exposes absolute offsets.
+fn list_viewport(window_height: f32) -> f32 {
+    (window_height - t::TITLEBAR_H - t::PLAYER_BAR_H - 40.0).max(200.0)
+}
+
+/// Keep the keyboard selection roughly centered in the list viewport by
+/// scrolling to `selection * ROW_H` (iced clamps past the ends).
+fn follow_selection(scroll_id: &'static str, selection: usize, window_height: f32) -> Task<Message> {
+    let viewport = list_viewport(window_height) + 80.0;
+    let y = (selection as f32 * t::ROW_H - viewport / 2.0).max(0.0);
+    iced::widget::operation::scroll_to(
+        scroll_id,
+        AbsoluteOffset { x: 0.0, y },
     )
 }
 
@@ -1348,7 +1790,7 @@ impl canvas::Program<Message> for BarsProgram {
     }
 }
 
-// — Icon helper ——————————————————————————————————————————————
+// — Icon helper ————————————————————————————————————————————————
 
 pub fn icon(bytes: &'static [u8], size: f32, color: Color) -> svg::Svg<'static> {
     svg(icons::handle(bytes))
