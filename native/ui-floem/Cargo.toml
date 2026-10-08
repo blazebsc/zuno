@@ -1,0 +1,15 @@
+[package]
+name = "zuno-ui-floem"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+zuno-core = { path = "../core" }
+floem = "0.2"
+im = "15.1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+crossbeam-channel = "0.5"
+
+[[bin]]
+name = "zuno-floem"
+path = "src/main.rs"
