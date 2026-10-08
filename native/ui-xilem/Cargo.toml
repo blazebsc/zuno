@@ -1,0 +1,16 @@
+[package]
+name = "zuno-ui-xilem"
+version = "0.1.0"
+edition = "2021"
+description = "Zuno native-GUI benchmark — Xilem (Masonry backend) implementation"
+license = "Apache-2.0"
+
+[[bin]]
+name = "zuno-xilem"
+path = "src/main.rs"
+
+[dependencies]
+zuno-core = { path = "../core" }
+xilem = "0.4"
+masonry = "0.4"
+tracing = "0.1"
