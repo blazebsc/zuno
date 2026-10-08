@@ -1,0 +1,14 @@
+[package]
+name = "zuno-ui-gpui"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "zuno-gpui"
+path = "src/main.rs"
+
+[dependencies]
+zuno-core = { path = "../core" }
+gpui = "0.2"
+image = "0.25"
+unicode-segmentation = "1"
