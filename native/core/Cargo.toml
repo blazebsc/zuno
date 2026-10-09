@@ -7,7 +7,15 @@ license = "Apache-2.0"
 
 [dependencies]
 # Same output stack the shipping app's `rust` audio engine uses (src-tauri/src/audio.rs):
-# cpal opens the device, rodio owns the sink. No symphonia here — the benchmark
-# synthesizes audio in-process instead of decoding downloaded Opus (see SPEC.md
-# §Audio), so the decoder feature flags are deliberately left off.
-rodio = { version = "0.22", default-features = false, features = ["playback"] }
+# cpal opens the device, rodio owns the sink. `symphonia-all` decodes everything
+# except Opus (AAC/MP3/FLAC/Vorbis/WAV) — the benchmark's synth path is unaffected.
+rodio = { version = "0.22", default-features = false, features = ["playback", "symphonia-all"] }
+# Demuxing only, pinned to what rodio pulls so the binary carries one copy.
+# (Same pair as src-tauri: symphonia has no Opus decoder, libopus decodes it.)
+symphonia = { version = "0.5", default-features = false, features = ["mkv", "ogg"] }
+# libopus, built from source via cmake (machine has both).
+opus = "0.3.1"
+# Sync artwork fetch (blocking, 10 s timeout) + stream download in the audio thread.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
+# Decode only: what the UI crates show, nothing more.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
