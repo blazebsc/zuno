@@ -18,6 +18,10 @@ pub struct Track {
     pub duration_sec: u32,
     pub explicit: bool,
     pub liked: bool,
+    /// YouTube video id. Empty for synthetic (`--bench`) tracks.
+    pub video_id: String,
+    /// Remote cover URL. `None` = procedural [`crate::artwork`] cover.
+    pub artwork_url: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -29,6 +33,8 @@ pub struct Album {
     pub track_ids: Vec<TrackId>,
     /// "Album" (10+ tracks) or "EP"/"Single" — shown in headers.
     pub kind: AlbumKind,
+    /// Remote cover URL. `None` = procedural cover.
+    pub artwork_url: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +60,8 @@ pub struct Artist {
     pub name: String,
     pub monthly_listeners: u32,
     pub album_ids: Vec<AlbumId>,
+    /// Remote portrait URL. `None` = procedural cover.
+    pub artwork_url: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +73,8 @@ pub struct Playlist {
     /// "Liked Songs" and the generated mixes behave slightly differently in
     /// the UI (fixed artwork, no delete).
     pub system: bool,
+    /// Remote cover URL. `None` = procedural cover.
+    pub artwork_url: Option<String>,
 }
 
 /// A resolved row — everything a track list row paints, so UIs never join

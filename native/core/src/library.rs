@@ -71,6 +71,8 @@ impl Library {
                         duration_sec: track_duration(&mut rng),
                         explicit: rng.range(0, 100) < 8,
                         liked: false,
+                        video_id: String::new(),
+                        artwork_url: None,
                     });
                     track_ids.push(id);
                 }
@@ -82,6 +84,7 @@ impl Library {
                     year: rng.range(1974, 2026) as u16,
                     track_ids,
                     kind,
+                    artwork_url: None,
                 });
             }
             artists.push(Artist {
@@ -89,6 +92,7 @@ impl Library {
                 name,
                 monthly_listeners: rng.range(4_000, 38_000_000),
                 album_ids,
+                artwork_url: None,
             });
         }
 
@@ -107,6 +111,7 @@ impl Library {
             description: Some("Every song you've liked".into()),
             track_ids: tracks.iter().filter(|t| t.liked).map(|t| t.id).collect(),
             system: true,
+            artwork_url: None,
         });
         let pl_words = [
             ("Late Night Drive", "Neon streets, empty highway"),
@@ -167,6 +172,7 @@ impl Library {
                 description: Some((*desc).into()),
                 track_ids: ids,
                 system: false,
+                artwork_url: None,
             });
         }
 
@@ -190,6 +196,7 @@ impl Library {
                 description: Some((*desc).into()),
                 track_ids: ids,
                 system: true,
+                artwork_url: None,
             });
         }
 

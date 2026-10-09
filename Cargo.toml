@@ -10,5 +10,5 @@
 # tree, and stays buildable exactly as before, untouched by the bake-off.
 [workspace]
 resolver = "2"
-members = ["native/core", "native/ui-iced"]
+members = ["native/core", "native/yt", "native/ui-iced"]
 exclude = ["src-tauri", "landing", "node_modules"]
