@@ -1,7 +1,8 @@
 //! One Innertube POST path for every call. Contexts, user agents and the
 //! API keys are verbatim from `src-tauri/src/lib.rs` (`create_*_context`,
 //! `try_youtube_api`); the SAPISIDHASH scheme is a line-for-line port of
-//! `applyCookieAuth` in `tauriFetch.ts`.
+//! `applyCookieAuth` in `tauriFetch.ts`. Cookie rotation folding follows
+//! the jar rules of lib.rs (see [`crate::session`]).
 
 use crate::error::{Result, YtError};
 use crate::session::Session;
@@ -126,16 +127,25 @@ pub fn sapisid_hash(sapisid: &str, client_name: &str, timestamp: u64) -> String 
 pub struct YtClient {
     http: reqwest::Client,
     session: Option<Session>,
+    decipherer: crate::decipher::Decipherer,
 }
 
 impl YtClient {
     /// No credentials. Search, browse, charts, stream resolution all work.
     pub fn unsigned() -> Result<Self> {
-        Ok(YtClient { http: default_http()?, session: None })
+        Ok(YtClient {
+            http: default_http()?,
+            session: None,
+            decipherer: crate::decipher::Decipherer::new()?,
+        })
     }
 
     pub fn with_session(session: Session) -> Result<Self> {
-        Ok(YtClient { http: default_http()?, session: Some(session) })
+        Ok(YtClient {
+            http: default_http()?,
+            session: Some(session),
+            decipherer: crate::decipher::Decipherer::new()?,
+        })
     }
 
     pub fn set_session(&mut self, session: Option<Session>) {
@@ -148,6 +158,21 @@ impl YtClient {
 
     pub fn signed_in(&self) -> bool {
         self.session.as_ref().is_some_and(|s| !s.is_empty())
+    }
+
+    pub(crate) fn http(&self) -> &reqwest::Client {
+        &self.http
+    }
+
+    pub(crate) fn decipherer(&self) -> &crate::decipher::Decipherer {
+        &self.decipherer
+    }
+
+    /// The loaded player script's `signatureTimestamp` (0 until the first
+    /// decipher, or after a rotation reset). Sent in the WEB-family player
+    /// bodies, exactly like youtubei.js's music/web clients.
+    pub fn signature_timestamp(&self) -> u64 {
+        self.decipherer.signature_timestamp()
     }
 
     fn require_session(&self) -> Result<&Session> {

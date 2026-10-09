@@ -157,6 +157,7 @@ mod tests {
             thumbnails: vec![YtThumb { url: "https://i.ytimg.com/vi/x/hqdefault.jpg".into(), width: 400, height: 225 }],
             explicit: false,
             playlist_id: None,
+            set_video_id: None,
         }
     }
 

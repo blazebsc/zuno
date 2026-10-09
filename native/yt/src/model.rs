@@ -33,6 +33,10 @@ pub struct YtTrack {
     pub thumbnails: Vec<YtThumb>,
     pub explicit: bool,
     pub playlist_id: Option<String>,
+    /// The playlist *row* id (`playlistSetVideoId`), not the song id — the
+    /// same song can appear twice in a list, so remove/reorder address rows.
+    /// Present on playlist pages only.
+    pub set_video_id: Option<String>,
 }
 
 impl YtTrack {
@@ -63,6 +67,10 @@ pub struct YtArtist {
     pub channel_id: String,
     pub name: String,
     pub subscriber_count: Option<String>,
+    /// Subscription state when the signed-in account is subscribed
+    /// (`subscribeButtonRenderer.subscribed`); `None` when the response
+    /// carries no subscribe button (unsigned browse).
+    pub subscribed: Option<bool>,
     pub thumbnails: Vec<YtThumb>,
     pub top_tracks: Vec<YtTrack>,
     pub albums: Vec<YtAlbumRefFull>,
@@ -121,4 +129,13 @@ pub struct YtShelf {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct YtHome {
     pub shelves: Vec<YtShelf>,
+}
+
+/// One page of a paginated track list — the app's `TrackPage` shape
+/// (`getPlaylistTrackPage`), fed to [`crate::api::collect_track_pages`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct YtTrackPage {
+    pub tracks: Vec<YtTrack>,
+    pub has_more: bool,
+    pub next_page_key: Option<String>,
 }

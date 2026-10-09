@@ -1,9 +1,14 @@
 //! Cookie session: import, identity, rotation, disk persistence.
 //!
 //! Mirrors the rules in `src-tauri/src/lib.rs` (`parse_cookie_header`,
-//! `apply_set_cookie`, `cookie_account_identity`): split on `;`, keep
-//! `NAME=value` pairs, drop attributes; a `Set-Cookie` that echoes a name
-//! back empty/`EXPIRED`/`deleted` removes it; only YouTube hosts rotate.
+//! `apply_set_cookie`, `cookie_account_identity`, the `CookieJarState`
+//! persistence throttle): split on `;`, keep `NAME=value` pairs, drop
+//! attributes; a `Set-Cookie` that echoes a name back empty/`EXPIRED`/
+//! `deleted` removes it; only `youtube.com` (and subdomains) rotate the jar;
+//! a rotated *credential* cookie (`__Secure-*PSIDTS` above all) is written to
+//! disk the moment it changes, while the noisy ones (`SIDCC`,
+//! `__Secure-*PSIDCC`) wait for a 300 s interval — Google rotates them on
+//! almost every response and nothing authenticates with them.
 //!
 //! Persisted as a plain JSON file under the platform data dir — no keyring
 //! dependency. The Tauri app's keyring/AES-GCM storage is stronger; a
@@ -11,11 +16,24 @@
 
 use crate::error::{Result, YtError};
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
+
+/// How often a rotation of [`SLOW_PERSIST_COOKIES`] is written back to disk.
+const PERSIST_INTERVAL: Duration = Duration::from_secs(300);
+/// Cookies whose rotation may be persisted late, because nothing
+/// authenticates with them. Everything else is written the moment it
+/// changes — Google retires the superseded value, so quitting inside the
+/// throttle window would leave a dead credential on disk.
+const SLOW_PERSIST_COOKIES: [&str; 3] = ["SIDCC", "__Secure-1PSIDCC", "__Secure-3PSIDCC"];
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Session {
     /// The `Cookie:` header value (`NAME=value; NAME=value; …`).
     pub cookie_header: String,
+    /// Last durable write, for the slow-persist throttle (never persisted
+    /// itself — serde skips are not needed because it stays `None` on disk).
+    #[serde(skip)]
+    pub persisted_at: Option<Instant>,
 }
 
 impl Session {
@@ -24,7 +42,7 @@ impl Session {
     /// a browser never sends those in a `Cookie` header, but pastes
     /// sometimes include them.
     pub fn import(header: &str) -> Self {
-        Session { cookie_header: serialize_pairs(&parse_pairs_filtered(header)) }
+        Session { cookie_header: serialize_pairs(&parse_pairs_filtered(header)), ..Default::default() }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -32,11 +50,11 @@ impl Session {
     }
 
     /// Which Google account this cookie belongs to, as far as the app cares:
-    /// the SAPISID-family value (mirrors `cookie_account_identity` +
-    /// `getSapisidAuthCookie`: `SAPISID`, `__Secure-1PAPISID`, `__Secure-3PAPISID`).
+    /// the SAPISID-family value (`cookie_account_identity` — same order as
+    /// lib.rs: `SAPISID`, then `__Secure-3PAPISID`, then `__Secure-1PAPISID`).
     pub fn account_identity(&self) -> Option<String> {
         let pairs = parse_pairs(&self.cookie_header);
-        for name in ["SAPISID", "__Secure-1PAPISID", "__Secure-3PAPISID"] {
+        for name in ["SAPISID", "__Secure-3PAPISID", "__Secure-1PAPISID"] {
             if let Some((_, v)) = pairs.iter().find(|(n, _)| n == name) {
                 return Some(v.clone());
             }
@@ -49,19 +67,37 @@ impl Session {
         self.account_identity()
     }
 
-    /// Fold response `Set-Cookie` values back into the session. Returns true
-    /// when the header changed. `url` gates rotation to YouTube hosts.
+    /// Fold response `Set-Cookie` values back into the session (`url` gates
+    /// rotation to YouTube hosts, like `is_youtube_cookie_host`). Persists to
+    /// disk under the lib.rs rule — credentials immediately, noisy cookies
+    /// at most once per [`PERSIST_INTERVAL`] — and reports whether anything
+    /// changed.
     pub fn merge_set_cookies(&mut self, url: &str, set_cookies: &[String]) -> bool {
         if !is_youtube_host(url) {
             return false;
         }
         let mut pairs = parse_pairs(&self.cookie_header);
         let mut changed = false;
+        let mut credential_changed = false;
         for sc in set_cookies {
-            changed |= apply_set_cookie(&mut pairs, sc);
+            if apply_set_cookie(&mut pairs, sc) {
+                changed = true;
+                credential_changed |= !is_slow_persist_cookie(sc);
+            }
         }
-        if changed {
-            self.cookie_header = serialize_pairs(&pairs);
+        if !changed {
+            return false;
+        }
+        self.cookie_header = serialize_pairs(&pairs);
+        let should_persist = credential_changed
+            || self
+                .persisted_at
+                .is_none_or(|at| at.elapsed() >= PERSIST_INTERVAL);
+        if should_persist {
+            self.persisted_at = Some(Instant::now());
+            if let Err(e) = self.save() {
+                eprintln!("[zuno-yt] session persist failed: {e}");
+            }
         }
         changed
     }
@@ -122,6 +158,7 @@ fn split_set_cookie(set_cookie: &str) -> Option<(&str, &str)> {
     Some((name, value.trim()))
 }
 
+/// `apply_set_cookie` from lib.rs, verbatim rules.
 fn apply_set_cookie(pairs: &mut Vec<(String, String)>, set_cookie: &str) -> bool {
     let Some((name, value)) = split_set_cookie(set_cookie) else {
         return false;
@@ -145,6 +182,12 @@ fn apply_set_cookie(pairs: &mut Vec<(String, String)>, set_cookie: &str) -> bool
     }
 }
 
+fn is_slow_persist_cookie(set_cookie: &str) -> bool {
+    split_set_cookie(set_cookie)
+        .is_some_and(|(name, _)| SLOW_PERSIST_COOKIES.contains(&name))
+}
+
+/// `is_youtube_cookie_host`: the jar has exactly one destination.
 fn is_youtube_host(url: &str) -> bool {
     let host = url
         .split("://")
@@ -155,9 +198,7 @@ fn is_youtube_host(url: &str) -> bool {
         .unwrap_or("")
         .trim_start_matches('.')
         .to_ascii_lowercase();
-    ["youtube.com", "googlevideo.com", "ytimg.com", "ggpht.com", "googleusercontent.com"]
-        .iter()
-        .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
+    host == "youtube.com" || host.ends_with(".youtube.com")
 }
 
 fn session_path() -> Option<std::path::PathBuf> {
@@ -187,11 +228,12 @@ mod tests {
     }
 
     #[test]
-    fn identity_prefers_sapisid() {
-        let s = Session::import("A=1; __Secure-3PAPISID=three; SAPISID=one");
-        assert_eq!(s.account_identity().as_deref(), Some("one"));
-        let s = Session::import("A=1; __Secure-3PAPISID=three");
+    fn identity_order_matches_lib_rs() {
+        // lib.rs checks SAPISID, then __Secure-3PAPISID, then __Secure-1PAPISID.
+        let s = Session::import("A=1; __Secure-1PAPISID=one; __Secure-3PAPISID=three");
         assert_eq!(s.account_identity().as_deref(), Some("three"));
+        let s = Session::import("A=1; __Secure-1PAPISID=one");
+        assert_eq!(s.account_identity().as_deref(), Some("one"));
         assert!(Session::import("A=1").account_identity().is_none());
     }
 
@@ -209,9 +251,23 @@ mod tests {
     }
 
     #[test]
-    fn rotation_rejects_foreign_hosts() {
+    fn rotation_rejects_foreign_and_googlevideo_hosts() {
+        // The jar has exactly one destination: youtube.com (lib.rs), so the
+        // CDN hosts that serve stream bytes never rotate it.
         let mut s = Session::import("SID=old");
         assert!(!s.merge_set_cookies("https://evil.example/x", &["SID=new".into()]));
-        assert_eq!(s.cookie_header, "SID=old");
+        assert!(!s
+            .merge_set_cookies("https://rr1---sn-qx8vapo1-53a6.googlevideo.com/videoplayback", &["SID=new".into()]));
+        assert!(s.merge_set_cookies("https://www.youtube.com/x", &["SID=new".into()]));
+        assert_eq!(s.cookie_header, "SID=new");
+    }
+
+    #[test]
+    fn slow_persist_classification() {
+        assert!(is_slow_persist_cookie("SIDCC=abc; Path=/"));
+        assert!(is_slow_persist_cookie("__Secure-1PSIDCC=abc"));
+        assert!(is_slow_persist_cookie("__Secure-3PSIDCC=abc"));
+        assert!(!is_slow_persist_cookie("__Secure-1PSIDTS=abc"), "credentials are not slow-persist");
+        assert!(!is_slow_persist_cookie("SAPISID=abc"));
     }
 }

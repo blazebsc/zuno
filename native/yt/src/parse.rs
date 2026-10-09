@@ -61,6 +61,15 @@ pub fn find_video_id(v: &Value) -> Option<String> {
     }
 }
 
+/// The playlist *row* id: `playlistItemData.playlistSetVideoId` — the id of
+/// the entry, not the song (a duplicate song has its own row).
+pub fn find_set_video_id(v: &Value) -> Option<String> {
+    v.get("playlistItemData")
+        .and_then(|d| d.get("playlistSetVideoId"))
+        .and_then(|x| x.as_str())
+        .map(str::to_string)
+}
+
 /// The item's own `navigationEndpoint.browseEndpoint.browseId` — NOT a deep
 /// search. Deep ids belong to runs (artist/album links inside a row) and
 /// must not stand in for the row's own target.
@@ -92,6 +101,21 @@ pub fn find_year(v: &Value) -> Option<u16> {
         _ => None,
     }
 }
+/// Subscription state from `subscribeButtonRenderer.subscribed`
+/// (`findArtistSubscriptionToggle` in the TS datasource).
+pub fn find_subscribed(v: &Value) -> Option<bool> {
+    match v {
+        Value::Object(map) => {
+            if let Some(btn) = map.get("subscribeButtonRenderer") {
+                return btn.get("subscribed").and_then(|s| s.as_bool());
+            }
+            map.values().find_map(find_subscribed)
+        }
+        Value::Array(items) => items.iter().find_map(find_subscribed),
+        _ => None,
+    }
+}
+
 /// Recursive search for the first `browseEndpoint.browseId` below `v`.
 /// When `prefix` is set, only ids starting with it match (e.g. `"MPRE"`).
 pub fn find_browse_id(v: &Value, prefix: Option<&str>) -> Option<String> {
@@ -376,6 +400,7 @@ pub fn parse_list_track(item: &Value) -> Option<YtTrack> {
         thumbnails: collect_thumbs(item),
         explicit: has_explicit_badge(item),
         playlist_id: find_playlist_id(item),
+        set_video_id: find_set_video_id(item),
     })
 }
 
@@ -404,6 +429,7 @@ pub fn parse_panel_track(item: &Value) -> Option<YtTrack> {
         thumbnails: collect_thumbs(item),
         explicit: has_explicit_badge(item),
         playlist_id: find_playlist_id(item),
+        set_video_id: find_set_video_id(item),
     })
 }
 

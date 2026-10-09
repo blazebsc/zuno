@@ -17,6 +17,11 @@ sha1 = "0.10"
 thiserror = "2"
 # Async Innertube POSTs; rt only — UIs own their runtimes.
 tokio = { version = "1", default-features = false, features = ["rt"] }
+# QuickJS for the ONE ported JS step: evaluating YouTube's own decipher code
+# (see docs/gui-benchmarks/yt.md — "decipher design"). Not a browser engine:
+# no DOM, no network from JS, no BotGuard. `parallel` makes Runtime Send+Sync
+# so the decipher cache can sit inside the shared client.
+rquickjs = { version = "0.14", features = ["parallel"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
