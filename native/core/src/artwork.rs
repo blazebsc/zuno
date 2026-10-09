@@ -216,6 +216,41 @@ impl ArtworkCache {
         buf
     }
 
+    /// The decoded RGBA buffer for a remote cover URL, cached under the same
+    /// 96-cover budget. Fetches (blocking, 10 s timeout, 8 MiB cap) and
+    /// decodes on first hit; failures fall back to the procedural cover for
+    /// the URL's hash so callers never branch on network state.
+    pub fn get_url(&self, url: &str, size: u32) -> Arc<Vec<u8>> {
+        let key = (url_key(url), size.max(8));
+        if let Some(hit) = self.inner.lock().unwrap().map.get(&key) {
+            return hit.clone();
+        }
+        let buf = fetch_decode(url, size).unwrap_or_else(|| cover(key.0, size));
+        self.insert_raw(key, Arc::new(buf))
+    }
+
+    /// Decode `data` (JPEG/PNG/WebP) and cache it as `url`'s cover — the
+    /// network-free half of [`Self::get_url`], and the seam tests use.
+    /// Returns `None` when the bytes are not a usable image.
+    pub fn insert_bytes(&self, url: &str, size: u32, data: &[u8]) -> Option<Arc<Vec<u8>>> {
+        let buf = decode_cover(data, size)?;
+        Some(self.insert_raw((url_key(url), size.max(8)), Arc::new(buf)))
+    }
+
+    fn insert_raw(&self, key: (u64, u32), buf: Arc<Vec<u8>>) -> Arc<Vec<u8>> {
+        let mut g = self.inner.lock().unwrap();
+        if let Some(hit) = g.map.get(&key) {
+            return hit.clone();
+        }
+        if g.order.len() >= g.cap {
+            let evict = g.order.remove(0);
+            g.map.remove(&evict);
+        }
+        g.order.push(key);
+        g.map.insert(key, buf.clone());
+        buf
+    }
+
     pub fn len(&self) -> usize {
         self.inner.lock().unwrap().map.len()
     }
@@ -228,6 +263,48 @@ impl Default for ArtworkCache {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// FNV-1a over the URL bytes — cache key only, not security.
+fn url_key(url: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in url.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Fetch + decode, `None` on any failure (caller falls back to procedural).
+fn fetch_decode(url: &str, size: u32) -> Option<Vec<u8>> {
+    if !url.starts_with("https://") {
+        return None;
+    }
+    let bytes = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .ok()?
+        .get(url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36")
+        .send()
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .bytes()
+        .ok()?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        return None;
+    }
+    decode_cover(&bytes, size)
+}
+
+/// JPEG/PNG/WebP bytes → `size × size` opaque RGBA, the same shape as
+/// [`cover`] so UI texture upload treats both identically.
+fn decode_cover(data: &[u8], size: u32) -> Option<Vec<u8>> {
+    let size = size.max(8);
+    let img = image::load_from_memory(data).ok()?;
+    let resized = img.resize_exact(size, size, image::imageops::FilterType::Lanczos3);
+    Some(resized.to_rgba8().into_raw())
 }
 
 #[cfg(test)]
@@ -251,6 +328,47 @@ mod tests {
     #[test]
     fn cache_evicts_at_cap() {
         let c = ArtworkCache::with_capacity(4);
+        for i in 0..6u64 {
+            c.get(i, 16);
+        }
+        assert_eq!(c.len(), 4);
+    }
+
+    #[test]
+    fn video_id_defaults_empty_and_artwork_none() {
+        let lib = crate::library::Library::generate(400, 7);
+        assert!(lib.tracks.iter().all(|t| t.video_id.is_empty()));
+        assert!(lib.tracks.iter().all(|t| t.artwork_url.is_none()));
+        assert!(lib.albums.iter().all(|a| a.artwork_url.is_none()));
+        assert!(lib.artists.iter().all(|a| a.artwork_url.is_none()));
+        assert!(lib.playlists.iter().all(|p| p.artwork_url.is_none()));
+    }
+
+    /// `insert_bytes` caches decoded covers with no network: a 1x1 red PNG
+    /// becomes a `size × size` opaque RGBA buffer, and the second insert of
+    /// the same URL hits the cache (same `Arc`, no re-decode).
+    #[test]
+    fn insert_bytes_decodes_and_caches() {
+        // 1x1 red PNG, generated inline — no fixture file, no network.
+        let png: Vec<u8> = {
+            let mut buf = Vec::new();
+            {
+                use image::codecs::png::PngEncoder;
+                use image::{ExtendedColorType, ImageEncoder};
+                let enc = PngEncoder::new(&mut buf);
+                enc.write_image(&[255, 0, 0], 1, 1, ExtendedColorType::Rgb8)
+                    .unwrap();
+            }
+            buf
+        };
+        let c = ArtworkCache::with_capacity(4);
+        let a = c.insert_bytes("https://i.ytimg.com/vi/x/hqdefault.jpg", 16, &png).unwrap();
+        assert_eq!(a.len(), 16 * 16 * 4);
+        assert!(a.chunks_exact(4).all(|p| p[3] == 255));
+        let b = c.insert_bytes("https://i.ytimg.com/vi/x/hqdefault.jpg", 16, &png).unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "same URL+size must hit the cache");
+        assert!(c.insert_bytes("https://x/y.jpg", 16, b"not an image").is_none());
+        // URL entries share the budget with procedural ones.
         for i in 0..6u64 {
             c.get(i, 16);
         }
