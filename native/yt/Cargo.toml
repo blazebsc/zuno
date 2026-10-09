@@ -1,0 +1,27 @@
+[package]
+name = "zuno-yt"
+version = "0.1.0"
+edition = "2021"
+description = "Framework-free real-YouTube-Music Innertube client shared by all native Zuno UIs"
+license = "Apache-2.0"
+
+[dependencies]
+zuno-core = { path = "../core" }
+# rustls, no defaults: native-tls pulls OS baggage. Blocking for the small
+# sync artwork fetch + stream download (no tokio runtime required by UIs).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# SAPISIDHASH is plain SHA-1 hex (see tauriFetch.ts applyCookieAuth) — no HMAC involved.
+sha1 = "0.10"
+thiserror = "2"
+# Async Innertube POSTs; rt only — UIs own their runtimes.
+tokio = { version = "1", default-features = false, features = ["rt"] }
+# QuickJS for the ONE ported JS step: evaluating YouTube's own decipher code
+# (see docs/gui-benchmarks/yt.md — "decipher design"). Not a browser engine:
+# no DOM, no network from JS, no BotGuard. `parallel` makes Runtime Send+Sync
+# so the decipher cache can sit inside the shared client.
+rquickjs = { version = "0.14", features = ["parallel"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

@@ -27,6 +27,8 @@ enum Command {
     Resume,
     Stop,
     SetVolume(f32),
+    PlayStream { url: String, mime: String, cookie: Option<String> },
+    SeekStream { sec: f64 },
 }
 
 /// Shared state between the audio thread and the handle. `position_samples`
@@ -38,6 +40,48 @@ struct Shared {
     playing: AtomicBool,
     /// Set when the current track's samples are exhausted.
     ended: AtomicBool,
+    /// True while a network stream (not the synthesizer) is loaded.
+    streaming: AtomicBool,
+    /// Wall-clock playhead for streams; the synth path uses sample counters.
+    stream_clock: std::sync::Mutex<StreamClock>,
+}
+
+#[derive(Default)]
+struct StreamClock {
+    /// Milliseconds banked before the current run started.
+    acc_ms: u64,
+    /// When the current run started (`None` while paused).
+    since: Option<std::time::Instant>,
+    /// Track length, 0 when the container did not say.
+    duration_ms: u64,
+}
+
+impl StreamClock {
+    fn elapsed_ms(&self) -> u64 {
+        self.acc_ms
+            + self.since.map(|t| t.elapsed().as_millis() as u64).unwrap_or(0)
+    }
+    fn pause(&mut self) {
+        self.acc_ms = self.elapsed_ms();
+        self.since = None;
+    }
+    fn resume(&mut self) {
+        if self.since.is_none() {
+            self.since = Some(std::time::Instant::now());
+        }
+    }
+    fn restart(&mut self, duration_ms: u64) {
+        self.acc_ms = 0;
+        self.since = Some(std::time::Instant::now());
+        self.duration_ms = duration_ms;
+    }
+    fn seek(&mut self, ms: u64) {
+        self.acc_ms = ms;
+        self.since = Some(std::time::Instant::now());
+    }
+    fn reset(&mut self) {
+        *self = StreamClock::default();
+    }
 }
 
 /// The `Send + Sync` audio controller. Clone-cheap via `Arc`.
@@ -59,6 +103,8 @@ impl PlayerHandle {
             total_samples: AtomicU64::new(0),
             playing: AtomicBool::new(false),
             ended: AtomicBool::new(false),
+            streaming: AtomicBool::new(false),
+            stream_clock: std::sync::Mutex::new(StreamClock::default()),
         });
         let thread_shared = Arc::clone(&shared);
         std::thread::Builder::new()
@@ -86,6 +132,33 @@ impl PlayerHandle {
             start_sample: start,
         });
         self.shared.playing.store(true, Ordering::Release);
+    }
+
+    /// Play a resolved stream URL (see `zuno-yt::resolve_stream`). The audio
+    /// thread downloads the bytes (`Range: bytes=0-`), decodes through
+    /// symphonia/libopus, and appends to the same sink the synth path uses.
+    /// A failed download ends the track (playing=false, ended=true) so the
+    /// queue keeps advancing instead of hanging.
+    pub fn play_stream(&self, url: &str, mime: &str, cookie: Option<&str>) {
+        self.shared.ended.store(false, Ordering::Release);
+        self.shared.streaming.store(true, Ordering::Release);
+        let _ = self.tx.send(Command::PlayStream {
+            url: url.to_string(),
+            mime: mime.to_string(),
+            cookie: cookie.map(str::to_string),
+        });
+        self.shared.playing.store(true, Ordering::Release);
+    }
+
+    /// Seek within the loaded stream. Recreates the decoder at the offset.
+    pub fn seek_stream(&self, sec: f64) {
+        self.shared.ended.store(false, Ordering::Release);
+        let _ = self.tx.send(Command::SeekStream { sec: sec.max(0.0) });
+        self.shared.playing.store(true, Ordering::Release);
+    }
+
+    pub fn is_streaming(&self) -> bool {
+        self.shared.streaming.load(Ordering::Acquire)
     }
 
     pub fn pause(&self) {
@@ -143,15 +216,23 @@ impl PlayerHandle {
         self.shared.playing.load(Ordering::Acquire)
     }
 
-    /// Playhead in seconds. Sample-counter-derived, not wall-clock — pauses
-    /// hold position, seeks jump it, exactly like the cached playhead in
-    /// `src/player/rustAudio.ts`.
+    /// Playhead in seconds. Sample-counter-derived for synth, wall-clock
+    /// for streams — pauses hold position, seeks jump it, exactly like the
+    /// cached playhead in `src/player/rustAudio.ts`.
     pub fn position_sec(&self) -> f64 {
-        self.shared.position_samples.load(Ordering::Acquire) as f64 / SAMPLE_RATE as f64
+        if self.shared.streaming.load(Ordering::Acquire) {
+            self.shared.stream_clock.lock().unwrap().elapsed_ms() as f64 / 1000.0
+        } else {
+            self.shared.position_samples.load(Ordering::Acquire) as f64 / SAMPLE_RATE as f64
+        }
     }
 
     pub fn duration_sec(&self) -> f64 {
-        self.shared.total_samples.load(Ordering::Acquire) as f64 / SAMPLE_RATE as f64
+        if self.shared.streaming.load(Ordering::Acquire) {
+            self.shared.stream_clock.lock().unwrap().duration_ms as f64 / 1000.0
+        } else {
+            self.shared.total_samples.load(Ordering::Acquire) as f64 / SAMPLE_RATE as f64
+        }
     }
 
     /// Drain the "track finished" signal. Returns the flag once.
@@ -191,6 +272,8 @@ fn audio_thread(rx: Receiver<Command>, shared: Arc<Shared>, initial_volume: f32)
     sink.set_volume(initial_volume);
     let mut loaded_total = 0u64;
     let mut active = false;
+    // The loaded stream's bytes, kept for seeks (decoder recreated at offset).
+    let mut stream_bytes: Option<(Arc<Vec<u8>>, String)> = None;
 
     loop {
         // Poll commands with the same 250 ms cadence `audio.rs` uses for its
@@ -206,14 +289,72 @@ fn audio_thread(rx: Receiver<Command>, shared: Arc<Shared>, initial_volume: f32)
                 shared.total_samples.store(total, Ordering::Release);
                 shared.position_samples.store(start_sample, Ordering::Release);
                 shared.ended.store(false, Ordering::Release);
+                shared.streaming.store(false, Ordering::Release);
+                stream_bytes = None;
                 active = total > start_sample;
             }
-            Ok(Command::Pause) => sink.pause(),
-            Ok(Command::Resume) => sink.play(),
+            Ok(Command::PlayStream { url, mime, cookie }) => {
+                match download_stream(&url, cookie.as_deref()) {
+                    Ok(bytes) => {
+                        let bytes = Arc::new(bytes);
+                        match open_stream_source(Arc::clone(&bytes), &mime) {
+                            Some(src) => {
+                                let ms = src.duration().map(|d| d.as_millis() as u64).unwrap_or(0);
+                                sink.clear();
+                                src.append_to(&sink);
+                                sink.play();
+                                shared.stream_clock.lock().unwrap().restart(ms);
+                                shared.total_samples.store(0, Ordering::Release);
+                                shared.ended.store(false, Ordering::Release);
+                                shared.streaming.store(true, Ordering::Release);
+                                stream_bytes = Some((bytes, mime));
+                                loaded_total = 0;
+                                active = true;
+                            }
+                            None => {
+                                eprintln!("[zuno-core] stream decode failed");
+                                shared.playing.store(false, Ordering::Release);
+                                shared.ended.store(true, Ordering::Release);
+                                active = false;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[zuno-core] stream download failed: {e}");
+                        shared.playing.store(false, Ordering::Release);
+                        shared.ended.store(true, Ordering::Release);
+                        active = false;
+                    }
+                }
+            }
+            Ok(Command::SeekStream { sec }) => {
+                if let Some((bytes, mime)) = stream_bytes.clone() {
+                    if let Some(mut src) = open_stream_source(bytes, &mime) {
+                        let _ = src.try_seek(Duration::from_secs_f64(sec));
+                        sink.clear();
+                        src.append_to(&sink);
+                        sink.play();
+                        shared.stream_clock.lock().unwrap().seek((sec * 1000.0) as u64);
+                        shared.ended.store(false, Ordering::Release);
+                        active = true;
+                    }
+                }
+            }
+            Ok(Command::Pause) => {
+                sink.pause();
+                shared.stream_clock.lock().unwrap().pause();
+            }
+            Ok(Command::Resume) => {
+                sink.play();
+                shared.stream_clock.lock().unwrap().resume();
+            }
             Ok(Command::Stop) => {
                 sink.clear();
                 sink.pause();
                 active = false;
+                shared.streaming.store(false, Ordering::Release);
+                shared.stream_clock.lock().unwrap().reset();
+                stream_bytes = None;
                 shared.position_samples.store(0, Ordering::Release);
                 shared.total_samples.store(0, Ordering::Release);
             }
@@ -222,14 +363,394 @@ fn audio_thread(rx: Receiver<Command>, shared: Arc<Shared>, initial_volume: f32)
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
         if active {
-            let pos = shared.position_samples.load(Ordering::Acquire);
-            if loaded_total > 0 && pos >= loaded_total {
-                active = false;
-                sink.pause();
-                shared.playing.store(false, Ordering::Release);
-                shared.ended.store(true, Ordering::Release);
+            if shared.streaming.load(Ordering::Acquire) {
+                // Streams end by duration or by decoder exhaustion (truncated
+                // downloads finish their buffered frames, then the sink drains).
+                let (pos_ms, dur_ms) = {
+                    let clock = shared.stream_clock.lock().unwrap();
+                    (clock.elapsed_ms(), clock.duration_ms)
+                };
+                if (dur_ms > 0 && pos_ms >= dur_ms) || sink.empty() {
+                    active = false;
+                    sink.pause();
+                    shared.playing.store(false, Ordering::Release);
+                    shared.ended.store(true, Ordering::Release);
+                }
+            } else {
+                let pos = shared.position_samples.load(Ordering::Acquire);
+                if loaded_total > 0 && pos >= loaded_total {
+                    active = false;
+                    sink.pause();
+                    shared.playing.store(false, Ordering::Release);
+                    shared.ended.store(true, Ordering::Release);
+                }
             }
         }
+    }
+}
+
+// — Network stream decode —————————————————————————————————————
+// Port of the decode path in `src-tauri/src/audio.rs` (BufferReader as a
+// MediaSource) + `src-tauri/src/opus_source.rs` (symphonia demuxes, libopus
+// decodes Opus; everything else goes to rodio's Decoder). Simplified: the
+// whole body is downloaded first (tracks are a few MB), so the progressive
+// MediaBuffer becomes an in-memory VecSource.
+//
+// Opus decodes to f32, rodio's Decoder to i16 — different `Source::Item`
+// types, so the two ride in an enum and each appends directly to the sink
+// (`append` is generic; no unified box type needed).
+
+/// `Range: bytes=0-` download into memory. Ranged like the browser asks;
+/// googlevideo refuses headerless full-file fetches on signed URLs.
+fn download_stream(url: &str, cookie: Option<&str>) -> Result<Vec<u8>, String> {
+    let mut req = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|e| e.to_string())?
+        .get(url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36")
+        .header("Accept", "*/*")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .header("Accept-Encoding", "identity;q=1, *;q=0")
+        .header("Range", "bytes=0-");
+    if let Some(cookie) = cookie {
+        req = req.header("Cookie", cookie);
+    }
+    let resp = req.send().map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("stream HTTP {}", resp.status()));
+    }
+    resp.bytes().map(|b| b.to_vec()).map_err(|e| e.to_string())
+}
+
+/// In-memory `Read + Seek + MediaSource` for symphonia probing.
+struct VecSource {
+    bytes: Arc<Vec<u8>>,
+    pos: u64,
+}
+
+impl VecSource {
+    fn new(bytes: Arc<Vec<u8>>) -> Self {
+        VecSource { bytes, pos: 0 }
+    }
+}
+
+impl std::io::Read for VecSource {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let start = self.pos as usize;
+        if start >= self.bytes.len() {
+            return Ok(0);
+        }
+        let n = (self.bytes.len() - start).min(out.len());
+        out[..n].copy_from_slice(&self.bytes[start..start + n]);
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl std::io::Seek for VecSource {
+    fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+        let target = match from {
+            std::io::SeekFrom::Start(o) => o as i64,
+            std::io::SeekFrom::Current(d) => self.pos as i64 + d,
+            std::io::SeekFrom::End(d) => self.bytes.len() as i64 + d,
+        };
+        if target < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
+        }
+        self.pos = (target as usize).min(self.bytes.len()) as u64;
+        Ok(self.pos)
+    }
+}
+
+impl symphonia::core::io::MediaSource for VecSource {
+    fn is_seekable(&self) -> bool {
+        true
+    }
+    fn byte_len(&self) -> Option<u64> {
+        Some(self.bytes.len() as u64)
+    }
+}
+
+/// Whether only libopus can decode this (port of `is_opus`).
+fn is_opus(mime_type: &str) -> bool {
+    let lowered = mime_type.to_ascii_lowercase();
+    lowered.contains("opus") || lowered.contains("webm")
+}
+
+/// Container sniffed from magic bytes (port of `container_mime_of`): the
+/// declared mime describes what was resolved for streaming, so stored bytes
+/// are routed by what they are. Rewinds before returning.
+fn sniff_container_mime(
+    reader: &mut (impl std::io::Read + std::io::Seek),
+) -> std::io::Result<Option<&'static str>> {
+    let mut header = [0u8; 64];
+    let mut filled = 0;
+    while filled < header.len() {
+        match reader.read(&mut header[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    reader.seek(std::io::SeekFrom::Start(0))?;
+    Ok(container_mime_of(&header[..filled]))
+}
+
+fn container_mime_of(header: &[u8]) -> Option<&'static str> {
+    if header.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        return Some("audio/webm; codecs=\"opus\"");
+    }
+    if header.starts_with(b"OggS") {
+        return Some(if header.windows(8).any(|window| window == b"OpusHead") {
+            "audio/opus"
+        } else {
+            "audio/ogg"
+        });
+    }
+    if header.len() >= 12 && &header[4..8] == b"ftyp" {
+        return Some("audio/mp4");
+    }
+    if header.starts_with(b"fLaC") {
+        return Some("audio/flac");
+    }
+    None
+}
+
+/// Decode `bytes` to a sink-ready source.
+fn open_stream_source(bytes: Arc<Vec<u8>>, mime: &str) -> Option<StreamSource> {
+    let mut probe = VecSource::new(Arc::clone(&bytes));
+    let effective = sniff_container_mime(&mut probe).ok().flatten().unwrap_or(mime);
+    if is_opus(effective) {
+        match OpusSource::new(Box::new(VecSource::new(Arc::clone(&bytes))), effective) {
+            Ok(src) => Some(StreamSource::Opus(src)),
+            Err(e) => {
+                eprintln!("[zuno-core] opus open failed ({e}), trying rodio");
+                open_rodio(bytes)
+            }
+        }
+    } else {
+        open_rodio(bytes)
+    }
+}
+
+enum StreamSource {
+    Opus(OpusSource),
+    Other(rodio::Decoder<std::io::Cursor<Vec<u8>>>),
+}
+
+impl StreamSource {
+    fn duration(&self) -> Option<Duration> {
+        use rodio::Source as _;
+        match self {
+            StreamSource::Opus(src) => src.total_duration(),
+            StreamSource::Other(dec) => dec.total_duration(),
+        }
+    }
+
+    fn try_seek(&mut self, pos: Duration) -> bool {
+        use rodio::Source as _;
+        match self {
+            StreamSource::Opus(src) => src.try_seek(pos).is_ok(),
+            StreamSource::Other(dec) => dec.try_seek(pos).is_ok(),
+        }
+    }
+
+    fn append_to(self, sink: &rodio::Player) {
+        match self {
+            StreamSource::Opus(src) => sink.append(src),
+            StreamSource::Other(dec) => sink.append(dec),
+        }
+    }
+}
+
+fn open_rodio(bytes: Arc<Vec<u8>>) -> Option<StreamSource> {
+    let cursor = std::io::Cursor::new(bytes.to_vec());
+    match rodio::Decoder::new(cursor) {
+        Ok(decoder) => Some(StreamSource::Other(decoder)),
+        Err(e) => {
+            eprintln!("[zuno-core] rodio decode failed: {e}");
+            None
+        }
+    }
+}
+
+// — Opus decode (symphonia demuxes, libopus decodes) —————————————————
+// Port of `src-tauri/src/opus_source.rs`; the progressive stall handling
+// collapses because the body is already in memory.
+
+/// Opus always decodes at 48 kHz (RFC 6716).
+const OPUS_SAMPLE_RATE: u32 = 48_000;
+
+/// Longest Opus frame: 120 ms at 48 kHz = 5760 samples per channel.
+const MAX_FRAME_SAMPLES: usize = 5_760;
+
+struct OpusSource {
+    format: Box<dyn symphonia::core::formats::FormatReader>,
+    decoder: opus::Decoder,
+    track_id: u32,
+    channels: rodio::ChannelCount,
+    pending: std::collections::VecDeque<f32>,
+    scratch: Vec<f32>,
+    total_duration: Option<Duration>,
+    skip_samples: usize,
+    exhausted: bool,
+}
+
+impl OpusSource {
+    fn new(
+        source: Box<dyn symphonia::core::io::MediaSource>,
+        mime_type: &str,
+    ) -> std::result::Result<Self, String> {
+        use symphonia::core::formats::FormatOptions;
+        use symphonia::core::io::MediaSourceStream;
+        use symphonia::core::meta::MetadataOptions;
+        use symphonia::core::probe::Hint;
+        let stream = MediaSourceStream::new(source, Default::default());
+        let mut hint = Hint::new();
+        if mime_type.contains("webm") || mime_type.contains("matroska") {
+            hint.with_extension("webm");
+        } else if mime_type.contains("ogg") || mime_type.contains("opus") {
+            hint.with_extension("ogg");
+        }
+        let probed = symphonia::default::get_probe()
+            .format(&hint, stream, &FormatOptions { enable_gapless: true, ..Default::default() }, &MetadataOptions::default())
+            .map_err(|e| format!("opus container probe failed: {e}"))?;
+        let format = probed.format;
+        let track = format
+            .tracks()
+            .iter()
+            .find(|t| t.codec_params.codec == symphonia::core::codecs::CODEC_TYPE_OPUS)
+            .ok_or_else(|| "container holds no Opus track".to_string())?;
+        let params = &track.codec_params;
+        let track_id = track.id;
+        let channel_count = params.channels.map(|c| c.count()).unwrap_or(2).max(1);
+        let channels = rodio::ChannelCount::new(channel_count as u16)
+            .ok_or_else(|| "opus track declared zero channels".to_string())?;
+        let opus_channels = match channel_count {
+            1 => opus::Channels::Mono,
+            2 => opus::Channels::Stereo,
+            other => return Err(format!("unsupported opus channel count: {other}")),
+        };
+        let decoder =
+            opus::Decoder::new(OPUS_SAMPLE_RATE, opus_channels).map_err(|e| format!("opus decoder init failed: {e}"))?;
+        let total_duration = params
+            .time_base
+            .zip(params.n_frames)
+            .and_then(|(tb, frames)| {
+                if tb.numer == 0 || tb.denom == 0 {
+                    return None;
+                }
+                let time = tb.calc_time(frames);
+                Some(Duration::from_secs_f64(time.seconds as f64 + time.frac))
+            });
+        let skip_samples = params.delay.unwrap_or(0) as usize * channel_count;
+        Ok(OpusSource {
+            format,
+            decoder,
+            track_id,
+            channels,
+            pending: std::collections::VecDeque::with_capacity(MAX_FRAME_SAMPLES * channel_count),
+            scratch: vec![0.0; MAX_FRAME_SAMPLES * channel_count],
+            total_duration,
+            skip_samples,
+            exhausted: false,
+        })
+    }
+
+    fn fill(&mut self) -> bool {
+        use symphonia::core::errors::Error as SymphoniaError;
+        while !self.exhausted {
+            // In-memory body: any read error is end-of-stream (or a corrupt
+            // packet stream with nothing more to decode).
+            let packet = match self.format.next_packet() {
+                Ok(packet) => packet,
+                Err(e) => {
+                    if !matches!(e, SymphoniaError::IoError(_)) {
+                        eprintln!("[zuno-core] opus demux ended: {e}");
+                    }
+                    self.exhausted = true;
+                    return false;
+                }
+            };
+            if packet.track_id() != self.track_id {
+                continue;
+            }
+            let frames = match self.decoder.decode_float(&packet.data, &mut self.scratch, false) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    eprintln!("[zuno-core] opus packet dropped: {e}");
+                    continue;
+                }
+            };
+            let sample_count = frames * self.channels.get() as usize;
+            let mut decoded = &self.scratch[..sample_count.min(self.scratch.len())];
+            if self.skip_samples > 0 {
+                let skipped = self.skip_samples.min(decoded.len());
+                self.skip_samples -= skipped;
+                decoded = &decoded[skipped..];
+            }
+            if decoded.is_empty() {
+                continue;
+            }
+            self.pending.extend(decoded.iter().copied());
+            return true;
+        }
+        false
+    }
+}
+
+impl Iterator for OpusSource {
+    type Item = f32;
+    #[inline]
+    fn next(&mut self) -> Option<f32> {
+        if let Some(sample) = self.pending.pop_front() {
+            return Some(sample);
+        }
+        if !self.fill() {
+            return None;
+        }
+        self.pending.pop_front()
+    }
+}
+
+impl rodio::Source for OpusSource {
+    #[inline]
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+    #[inline]
+    fn channels(&self) -> rodio::ChannelCount {
+        self.channels
+    }
+    #[inline]
+    fn sample_rate(&self) -> rodio::SampleRate {
+        rodio::SampleRate::new(OPUS_SAMPLE_RATE).expect("48 kHz is not zero")
+    }
+    #[inline]
+    fn total_duration(&self) -> Option<Duration> {
+        self.total_duration
+    }
+    fn try_seek(&mut self, position: Duration) -> std::result::Result<(), rodio::source::SeekError> {
+        use symphonia::core::formats::{SeekMode, SeekTo};
+        use symphonia::core::units::Time;
+        self.format
+            .seek(
+                SeekMode::Coarse,
+                SeekTo::Time { time: Time::from(position.as_secs_f64()), track_id: Some(self.track_id) },
+            )
+            .map_err(|e| {
+                eprintln!("[zuno-core] opus seek failed: {e}");
+                rodio::source::SeekError::NotSupported { underlying_source: "OpusSource" }
+            })?;
+        self.pending.clear();
+        self.exhausted = false;
+        let _ = self.decoder.reset_state();
+        Ok(())
     }
 }
 

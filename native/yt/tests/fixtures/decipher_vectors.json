@@ -1,0 +1,13 @@
+{
+ "player_id": "ec429320",
+ "signature_timestamp": 20733,
+ "vectors": [
+  {
+   "n": "bobtest123",
+   "expected_n": "kuIsIg56",
+   "sp": "sig",
+   "s": "_wG5AH7CqiqMDINQ9QkLM6YPQK0KjAN0D-UOuIsgB1NAQ4DMMnSQ4Q-UOi-BokAF4qQN0OPaiiUA5IA",
+   "expected_sig": "97CqiqMDINQHQkLM6YPQK0KjAN0D-UOuIsgB1NAQ4DMMnSQ4Q-UOi-BokAF4qQN0OPaiiUA5I"
+  }
+ ]
+}
