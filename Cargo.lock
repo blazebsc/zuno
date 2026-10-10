@@ -6385,7 +6385,9 @@ name = "zuno-ui-iced"
 version = "0.1.0"
 dependencies = [
  "iced",
+ "tokio",
  "zuno-core",
+ "zuno-yt",
 ]
 
 [[package]]

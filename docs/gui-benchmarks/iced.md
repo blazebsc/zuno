@@ -143,3 +143,147 @@ the full schedule.
   synthetic library + artwork cache — before any list view is opened.
 - First scroll into the 5k list freezes briefly (~0.5 s) while all rows and
   artwork handles are built; after that, scrolling is smooth.
+
+## Real-YouTube wiring (native/yt, commit on `gui/iced`)
+
+The benchmark app above is untouched in `--bench`; interactive mode now
+drives the real YouTube Music catalog through `zuno-yt`, per
+`docs/gui-benchmarks/yt.md`. Deps added to `native/ui-iced/Cargo.toml`:
+`zuno-yt = { path = "../yt" }` and `tokio` with `rt` only (background
+threads each build a current-thread runtime for the async Innertube POSTs).
+
+### Async model
+
+Every YouTube call runs on a short-lived `std::thread` and reports back
+over a `std::mpsc` channel drained on the existing 16 ms tick (at most 32
+events per frame) — not iced `Task::perform`. Two reasons: the artwork
+fetch is blocking and must never sit on a framework runtime, and one
+uniform bridge keeps `--bench` provably thread-free (still 42 threads,
+zero `[yt]` lines in both bench logs below). First paint is the instant
+synthetic library; the home payload swaps in over the network (observed in
+place within ~12 s of launch on this network, slowest of three launches —
+window boot included; the `get_home` round-trip itself is a couple of
+seconds).
+
+### What loads live (all observed, unsigned)
+
+- **Home**: `YtClient::unsigned()` (or the saved session, see sign-in) →
+  `get_home()` → `YtLibrary::from_home` replaces `app.library`; raw
+  `YtHome` shelves render as sections with drill-down cards
+  (`docs/gui-benchmarks/iced-yt-home.png`: Video charts, Top artists, New
+  albums & singles). Unsigned home is thin: 5 shelves, 20 tracks, and the
+  chart rows carry **no durations (all `0:00`) and no thumbnails** — the
+  shelf playlist/artist headers are the rich part.
+- **Search**: the existing box, 350 ms debounce, stale arrivals dropped by
+  sequence number. `search` → `from_search` swap; rows follow library order
+  (YouTube's ranking), raw album/artist/playlist headers render as shelves
+  with browse ids. `"radiohead creep"` → 14 tracks, 3 albums, 5 artists in
+  ~2–5 s.
+- **Album/artist/playlist pages**: `OpenYtAlbum/Artist/Playlist` fetch
+  `get_album` / `get_artist` (top tracks via `from_tracks`) / `get_playlist`
+  meta + full `get_playlist_tracks` (the paginated path), swap, and navigate
+  to the matched collection (`"The Bends"` opened live to `Album(0)`).
+  Search-result album cards open the local grouping instead — core `Album`
+  has no browse-id field to round-trip, so no second fetch there.
+- **Artwork**: one background thread per swap fetches up to 48 deduped
+  URLs (`zuno_yt::fetch_artwork`), progressively inserting all four view
+  sizes (32/40/176/232) via `insert_bytes`; views use `get_url`-backed
+  handles with the procedural tile underneath. Raw shelf/header thumbnails
+  are included — unsigned home tracks carry none, and without that the home
+  cards would stay procedural forever (found by screenshot, fixed). A real
+  ordering bug was caught the same way: the raw results must be stored
+  *before* the swap, because `fetch_covers` reads them.
+- **Playback**: every play routes through `AppState::play_from` first
+  (queue, source list, current stay correct — Repeat All wrap works), then
+  the just-started synth is paused back-to-back (nothing audible) and a
+  resolve thread runs `resolve_stream_url` → `player.play_stream(url, mime,
+  cookie)`. Next/previous/seek/tick go through stream-aware wrappers
+  (`seek_stream`, pause/resume transport, auto-advance on core's `ended`
+  flag). Synth stays for `--bench` and video-less tracks.
+- **Sign-in**: Settings has a cookie-header field + Sign in/Sign out.
+  Paste → `Session::import` → `with_session` → `get_library` swaps in the
+  user library; the session persists (`Session::save`) and a saved session
+  auto-loads at boot (identity shown, cookie passed to `play_stream`).
+  Mutations (like/playlist edits) are NOT wired to any button — signed
+  client is ready, no affordance was added.
+
+### Safety around the swap
+
+Swapping the library resets playback/queue/selection (track/album/artist
+ids index directly — a stale id would panic), Home navigation rebuilds the
+home collection deterministically from the cached `YtHome` (no refetch),
+and history stranded on an old collection id renders a "Nothing here"
+page instead of indexing OOB. In-flight resolves carry a sequence number;
+late URLs are dropped unless the same video is still current, and pausing
+mid-resolve suppresses the late start.
+
+### The load-bearing finding: googlevideo 403s full downloads here
+
+Playback resolves fine live (`YouTube iOS`, ~130 kbps `audio/mp4`) but
+core's `download_stream` (`Range: bytes=0-`, whole file) gets
+**HTTP 403** on every URL, so no audible stream audio is achievable from
+this machine today. Isolated with a scratch probe (deleted after):
+
+| request | result |
+|---|---|
+| `Range: bytes=0-1023`, no UA (the yt online test's shape) | 206, 1024 bytes |
+| `Range: bytes=0-1048575` | 206, 1 MiB |
+| `Range: bytes=0-` (core's shape), ± browser headers | **403** |
+| `Range: bytes=0-4436255` (whole 4.4 MB file, bounded) | **403** |
+| `bytes=1048576-…` second chunk, new or same keepalive connection | **403** |
+
+Only the first ~1 MB is served; everything past it 403s regardless of
+connection reuse. `native/core` and `native/yt` are frozen to this branch,
+so the fix is noted, not made: core needs a progressive/chunked download
+(and even that may not suffice on a network throttled this hard —
+`yt.md`'s "serves full tracks" rested on a 1 KB probe). This gates all
+seven wiring branches equally, not just iced. Everything up to the bytes
+is verified live (shelves/search/detail/resolve/art); the decode path is
+core's tested surface (28/28) and the identical rodio→cpal sink is proven
+by the bench playback phase below.
+
+Test-conditions honesty: a sibling agent's `ydotool` automation shares this
+display, and stray keystrokes/clicks landed in the iced window mid-test
+(extra searches, a playlist open, a track play). The app rode through all
+of it — swaps, phantom navigation, and a 14-track 403 cascade with
+correct failover advance — without a panic.
+
+### Fresh `--bench` (wiring present, 2026-10-10)
+
+Run 1:
+
+| phase | samples | RSS mean | RSS min | RSS max |
+|-------|---------:|--------:|--------:|--------:|
+| startup (first frame + library) | 1 | 206.8 MB | 206.8 MB | 206.8 MB |
+| idle | 7 | 207.1 MB | 206.8 MB | 207.3 MB |
+| scroll | 19 | 476.0 MB | 207.1 MB | 490.9 MB |
+| select | 5 | 490.9 MB | 490.9 MB | 490.9 MB |
+| playback | 15 | 491.3 MB | 491.0 MB | 491.4 MB |
+
+- Peak RSS (VmHWM): 491.4 MB
+- CPU: 41.5s over 48s wall (86% of one core)
+- Threads at exit: 42
+
+Run 2:
+
+| phase | samples | RSS mean | RSS min | RSS max |
+|-------|---------:|--------:|--------:|--------:|
+| startup (first frame + library) | 1 | 207.6 MB | 207.6 MB | 207.6 MB |
+| idle | 7 | 207.8 MB | 207.6 MB | 208.0 MB |
+| scroll | 18 | 491.7 MB | 491.6 MB | 491.8 MB |
+| select | 4 | 491.8 MB | 491.8 MB | 491.8 MB |
+| playback | 15 | 491.8 MB | 491.8 MB | 491.8 MB |
+
+- Peak RSS (VmHWM): 491.8 MB
+- CPU: 41.3s over 48s wall (86% of one core)
+- Threads at exit: 42
+
+Verdict: comparable, no leak. Scroll/select/playback peaks (490.9–491.8
+MB) match the branch's 489–491 MB band; CPU (86%) and thread count (42)
+are identical. Startup/idle sit ~3 MB above the old 204–205 MB — a static
+cost of linking the YT stack (reqwest/rustls, tokio-rt, QuickJS), not a
+leak: phases are flat, both bench logs contain zero `[yt]` lines, and the
+bench library has no `video_id`/`artwork_url` so every YT path is dead
+code there by construction. (Run-1 scroll mean looks low only because the
+5k-row build landed mid-phase — min 207.1 pre-build, max 490.9 after;
+the same first-scroll freeze the old report notes.)

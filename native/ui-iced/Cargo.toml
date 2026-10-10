@@ -11,4 +11,9 @@ path = "src/main.rs"
 
 [dependencies]
 zuno-core = { path = "../core" }
+zuno-yt = { path = "../yt" }
+# Current-thread runtime for the background YouTube threads (Innertube POSTs
+# are async; every thread builds its own runtime and reports back over a
+# std::mpsc channel drained on the 16 ms tick — no framework runtime needed).
+tokio = { version = "1", default-features = false, features = ["rt"] }
 iced = { version = "0.14", features = ["image", "canvas", "tokio", "svg", "lazy"] }
