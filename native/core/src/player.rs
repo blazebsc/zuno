@@ -403,25 +403,153 @@ fn audio_thread(rx: Receiver<Command>, shared: Arc<Shared>, initial_volume: f32)
 /// `Range: bytes=0-` download into memory. Ranged like the browser asks;
 /// googlevideo refuses headerless full-file fetches on signed URLs.
 fn download_stream(url: &str, cookie: Option<&str>) -> Result<Vec<u8>, String> {
-    let mut req = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()
-        .map_err(|e| e.to_string())?
-        .get(url)
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36")
+    // Faithful port of `fetch_audio_ranged` + `fetch_audio_bytes` +
+    // `googlevideo_audio_request` (src-tauri/src/lib.rs). The single
+    // whole-file GET this replaced died with 403 past ~1 MB: googlevideo
+    // throttles a sequential stream hard, so several `range=` slices in
+    // flight side-step it — same reason, same fix.
+    let total = signed_content_length(url).unwrap_or(0);
+    if total <= AUDIO_MIN_CHUNK_BYTES {
+        return fetch_stream_whole(url, cookie, total);
+    }
+    let chunk_size = audio_chunk_size(total);
+    let mut ranges = Vec::new();
+    let mut start = 0u64;
+    while start < total {
+        let end = (start + chunk_size - 1).min(total - 1);
+        ranges.push((start, end));
+        start = end + 1;
+    }
+    // Sync core, no futures-util: one short-lived thread per range inside a
+    // scope (6 max, same concurrency as the app's `buffer_unordered(6)`).
+    let chunks: Vec<(u64, Result<Vec<u8>, String>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = ranges
+            .into_iter()
+            .map(|(start, end)| {
+                let ranged = audio_url_with_range(url, start, end);
+                let cookie = cookie.map(str::to_string);
+                scope.spawn(move || (start, fetch_stream_range(&ranged, cookie.as_deref())))
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap_or((0, Err("range thread panicked".into())))).collect()
+    });
+    // One refused range invalidates the assembly: restart on the whole-file
+    // path rather than returning a buffer with a hole in it.
+    for (start, result) in &chunks {
+        if let Err(error) = result {
+            eprintln!("[zuno-core] stream range {start} failed ({error}), falling back to whole-file");
+            return fetch_stream_whole(url, cookie, total);
+        }
+    }
+    let mut sorted: Vec<(u64, Vec<u8>)> = chunks
+        .into_iter()
+        .map(|(start, result)| (start, result.unwrap_or_default()))
+        .collect();
+    sorted.sort_by_key(|(start, _)| *start);
+    let mut bytes = Vec::with_capacity(total as usize);
+    for (_, body) in sorted {
+        bytes.extend_from_slice(&body);
+    }
+    Ok(bytes)
+}
+
+/// Whole-file fetch for small tracks (or the ranged fallback). Asked for the
+/// way the browser asks: `range=0-{total-1}` in the query string when `clen`
+/// is known — still without a `Range` header, which is what gets these
+/// refused.
+fn fetch_stream_whole(url: &str, cookie: Option<&str>, total: u64) -> Result<Vec<u8>, String> {
+    let ranged = if total > 0 {
+        audio_url_with_range(url, 0, total - 1)
+    } else {
+        url.to_string()
+    };
+    fetch_stream_range(&ranged, cookie)
+}
+
+fn stream_client_for(url: &str) -> Result<reqwest::blocking::Client, String> {
+    let mut builder = reqwest::blocking::Client::builder().timeout(Duration::from_secs(120));
+    if let Some(addr) = signed_googlevideo_local_address(url) {
+        // Signed googlevideo URLs embed an `ip=` parameter; the client binds
+        // its local address to the matching IP family so the signature stays
+        // valid on dual-stack machines.
+        builder = builder.local_address(addr);
+    }
+    builder.build().map_err(|e| e.to_string())
+}
+
+/// One ranged slice, asked for exactly the way the app asks: Chrome UA,
+/// `identity` encoding (the length check depends on Content-Length meaning
+/// what it says), music.youtube.com Origin/Referer, optional session cookie.
+fn fetch_stream_range(ranged_url: &str, cookie: Option<&str>) -> Result<Vec<u8>, String> {
+    let mut req = stream_client_for(ranged_url)?
+        .get(ranged_url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
         .header("Accept", "*/*")
-        .header("Accept-Language", "en-US,en;q=0.9")
         .header("Accept-Encoding", "identity;q=1, *;q=0")
-        .header("Range", "bytes=0-");
-    if let Some(cookie) = cookie {
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .header("Origin", "https://music.youtube.com")
+        .header("Referer", "https://music.youtube.com/");
+    if let Some(cookie) = cookie.filter(|c| !c.trim().is_empty()) {
         req = req.header("Cookie", cookie);
     }
     let resp = req.send().map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
+        // googlevideo refuses with an empty body; the status is the whole
+        // diagnostic, same as the app's `send_audio_request` warning.
         return Err(format!("stream HTTP {}", resp.status()));
     }
     resp.bytes().map(|b| b.to_vec()).map_err(|e| e.to_string())
 }
+
+/// `clen` rather than a probe request: a `range=` query is answered with 200
+/// and just that slice, so the response cannot report the total. The URL
+/// states the length itself, covered by the signature.
+fn signed_content_length(url: &str) -> Option<u64> {
+    url.split('?').nth(1)?.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == "clen").then(|| value.parse::<u64>().ok()).flatten()
+    })
+}
+
+/// Append `range=start-end` to the query WITHOUT re-encoding it —
+/// re-encoding `==` breaks the signature (same rule as the app).
+fn audio_url_with_range(url: &str, start: u64, end: u64) -> String {
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}range={start}-{end}")
+}
+
+fn signed_googlevideo_local_address(url: &str) -> Option<std::net::IpAddr> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let host = url.split("://").nth(1)?.split('/').next()?;
+    if !host.ends_with(".googlevideo.com") {
+        return None;
+    }
+    let query = url.split('?').nth(1)?;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=')?;
+        if key == "ip" {
+            // Percent-decoding is unnecessary: an IP never carries encodables.
+            if let Ok(signed) = value.parse::<IpAddr>() {
+                return Some(match signed {
+                    IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Bytes per range request: aim for ~6 ranges in flight, floored at 512 KiB
+/// (a fixed 4 MiB was previously both size and threshold, so a typical 2-4 MB
+/// song never split at all) and capped at 4 MiB.
+fn audio_chunk_size(total: u64) -> u64 {
+   const OFFLINE_CHUNK_CONCURRENCY: u64 = 6;
+    const OFFLINE_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
+    (total / OFFLINE_CHUNK_CONCURRENCY).max(AUDIO_MIN_CHUNK_BYTES).min(OFFLINE_CHUNK_BYTES)
+}
+
+const AUDIO_MIN_CHUNK_BYTES: u64 = 512 * 1024;
 
 /// In-memory `Read + Seek + MediaSource` for symphonia probing.
 struct VecSource {
@@ -904,6 +1032,57 @@ impl rodio::Source for SynthSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn range_url_appends_without_disturbing_the_signature() {
+        // Same cases as the app's `audio_url_with_range_*` test: query
+        // present joins with `&`, absent starts with `?`, and percent-encoded
+        // values (notably `==`) survive untouched.
+        assert_eq!(
+            audio_url_with_range("https://rr6.googlevideo.com/videoplayback?itag=140", 0, 1023),
+            "https://rr6.googlevideo.com/videoplayback?itag=140&range=0-1023"
+        );
+        assert_eq!(
+            audio_url_with_range("https://rr6.googlevideo.com/videoplayback", 10, 20),
+            "https://rr6.googlevideo.com/videoplayback?range=10-20"
+        );
+        assert!(audio_url_with_range("https://x/y?xpc=EgVo2aDSNQ%3D%3D", 0, 1)
+            .contains("xpc=EgVo2aDSNQ%3D%3D"));
+    }
+
+    #[test]
+    fn content_length_reads_clen() {
+        assert_eq!(
+            signed_content_length("https://rr6.googlevideo.com/videoplayback?itag=140&clen=4844302"),
+            Some(4_844_302)
+        );
+        assert_eq!(signed_content_length("https://rr6.googlevideo.com/videoplayback?itag=140"), None);
+    }
+
+    #[test]
+    fn chunk_size_splits_a_song_and_bounds_the_extremes() {
+        // A 2.5 MB song splits into several ranges; tiny files stay whole
+        // (single request), huge ones cap at 4 MiB per range.
+        let mid = audio_chunk_size(2_500_000);
+        assert!(mid >= AUDIO_MIN_CHUNK_BYTES && mid <= 4 * 1024 * 1024);
+        assert_eq!(audio_chunk_size(100_000), AUDIO_MIN_CHUNK_BYTES);
+        assert_eq!(audio_chunk_size(1_000_000_000), 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn signed_ip_binds_the_matching_family() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        assert_eq!(
+            signed_googlevideo_local_address("https://x.googlevideo.com/v?ip=203.0.113.7"),
+            Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+        );
+        assert_eq!(
+            signed_googlevideo_local_address("https://x.googlevideo.com/v?ip=2001:db8::1"),
+            Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED))
+        );
+        assert_eq!(signed_googlevideo_local_address("https://x.example.com/v?ip=203.0.113.7"), None);
+        assert_eq!(signed_googlevideo_local_address("https://x.googlevideo.com/v"), None);
+    }
 
     #[test]
     fn synth_is_bounded_and_deterministic() {

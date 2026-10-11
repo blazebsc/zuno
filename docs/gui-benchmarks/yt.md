@@ -35,7 +35,18 @@ HTTPS plus byte downloads. No WebView, no browser/JS engine, no yt-dlp.
 
 ## Deliberately NOT ported (WebView-app exclusives)
 
-- **PO-token/BotGuard attestation** — needs a real browser challenge; unattested direct URLs serve full tracks for native playback (verified), only the WebView's *download* path hits the 1 MiB gate. Production native playback needs nothing here.
+- **PO-token/BotGuard attestation** — needs a real browser challenge, and the
+  1 MiB gate is NOT bypassed without it: measured, googlevideo serves a
+  rolling few-hundred-KB grace per IP for PO-token-less requests (128 KiB
+  chunks paced 1/s die after ~3; 512 KiB on a fresh URL 403s outright once
+  the rolling budget is spent; 1 KiB probes always pass) on EVERY client
+  class tried (IOS direct, ANDROID direct, deciphered WEB/WEB_REMIX).
+  Pacing, concurrency, and fresh re-resolution do not beat it — it is a
+  per-IP byte budget, not per-URL. This matches the shipping app's own
+  notes ("music and web are fallbacks whose URLs are gated at 1 MiB
+  regardless… Only a PO token YouTube accepts" lifts it) — and the app
+  mints PO tokens in the WebView, which the native build deliberately has
+  none of. See "Streaming throttling" below for the measurements.
 - **Sign-in window flow** — replaced by pasting a `Cookie:` header into `Session::import`. Production needs the WebView sign-in + keyring persist.
 - **Likes/ratings, playlist edits, downloads, lyrics** — authenticated mutations and side systems; production ports them as further typed `api.rs` methods over the same `post_signed`. *(Update, phase 1b: the mutations are now ported — see "Mutations" below. Downloads remain a UI concern over `resolve_download_url`; lyrics remain excluded.)*
 
@@ -176,9 +187,45 @@ YouTube's ~131 kbps AAC tier to the 49 kbps one over 3 kbps).
 is NOT ported — it needs a real browser challenge. The app's "download" client
 is the attested one; here it runs unattested, which collapses the app's
 `download`/`music` labels onto the same client set (documented on
-`resolve_stream_url_quality`). Direct URLs serve full tracks for native
-playback (verified live); the WebView's 1 MiB gate applies only to the
-app's unattested *download* path.
+`resolve_stream_url_quality`). Without attestation, googlevideo serves a
+short rolling per-IP byte grace and then 403s — measured and documented in
+"Streaming throttling" below; full-track native playback is therefore
+gated the same way the app's unattested paths are.
+
+## Streaming throttling (measured 2026-10-09/10)
+
+Live measurements from this machine, unsigned, no PO token — all numbers
+real, all reproducible from the curl commands in the session log:
+
+| probe | result |
+|---|---|
+| 1 KiB head (`range=0-1023`), fresh or spent IP | always **200**, serves bytes |
+| 512 KiB on a fresh URL after prior activity | **403** immediately |
+| 128 KiB chunks, paced 1/s, fresh URL | **200, 200, 200, then 403 403 403…** |
+| Whole-file GET (no `range=`, no `Range:` header) | **403** |
+| Same probes via ANDROID / deciphered WEB_REMIX URLs | same wall |
+| ~5 min later, same probes on a fresh resolution | grace window partially reset |
+
+Interpretation: a **rolling per-IP byte budget** (order of a few hundred KB
+per minute, exempting tiny probes) gates PO-token-less media requests,
+regardless of client class, chunk size, pacing, or URL freshness. This is
+the gate the shipping app's source already describes for its unattested
+clients ("gated at 1 MiB regardless") — the app's working path is PO
+tokens minted by the WebView's real-browser BotGuard, which the native
+build deliberately does not embed.
+
+Consequences, stated honestly:
+- **Playable today**: the first seconds of any track (grace window), full
+  tracks whenever the budget allows (quiet network / different egress),
+  everything once a session cookie is attached IF signed-in resolution
+  lifts the gate (untested — needs a pasted session).
+- **Not working**: sustained full-track streaming on a spent IP without a
+  PO token, which no amount of downloader engineering fixes — the fix is
+  policy (attestation), and attestation is the one browser-shaped piece.
+- `core::player::download_stream` is now a faithful port of the app's
+  ranged downloader (correct headers, `range=` query slices, signed-IP
+  family binding, whole-file fallback) so the client extracts every byte
+  the server is willing to give, and fails cleanly on the rest.
 
 ## Endpoint coverage (reads)
 
