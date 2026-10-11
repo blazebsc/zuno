@@ -1255,7 +1255,7 @@ component HomePage inherits Rectangle {
                 cards: root.recent;
                 card-click(k, id) => { root.card-click(k, id); }
             }
-            Shelf {
+            if root.mixes.length > 0 : Shelf {
                 title: "Made for you";
                 cards: root.mixes;
                 card-click(k, id) => { root.card-click(k, id); }
@@ -1546,6 +1546,7 @@ component DetailPage inherits Rectangle {
 component SearchPage inherits Rectangle {
     in-out property <string> query-text;
     in property <bool> has-query: false;
+    in property <bool> live: false;
     in property <[CardData]> top;
     in property <[TrackRow]> songs;
     in property <[CardData]> albums;
@@ -1591,7 +1592,7 @@ component SearchPage inherits Rectangle {
             }
 
             if !root.has-query : Text {
-                text: "Search filters all 5,000 tracks as you type. Press Ctrl+K anywhere.";
+                text: root.live ? "Live results from YouTube Music as you type." : "Search filters all 5,000 tracks as you type. Press Ctrl+K anywhere.";
                 color: Zt.muted-fg;
                 font-size: 14px;
             }
@@ -1689,6 +1690,8 @@ component SettingRow inherits Rectangle {
 }
 
 component SettingsPage inherits Rectangle {
+    in property <string> yt-status: "";
+    callback sign-in(string);
     background: Zt.bg;
     ScrollView {
         VerticalLayout {
@@ -1740,6 +1743,34 @@ component SettingsPage inherits Rectangle {
                 }
                 SettingRow { label: "Cache"; value: "4 GB"; }
                 SettingRow { label: "Downloads ceiling"; value: "8 GB"; }
+            }
+            VerticalLayout {
+                spacing: 10px;
+                Text {
+                    text: "YouTube";
+                    color: Zt.fg;
+                    font-size: 18px;
+                    font-weight: 600;
+                }
+                Text {
+                    text: root.yt-status == "" ? "Not connected." : root.yt-status;
+                    color: Zt.muted-fg;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                cookie-input := LineEdit {
+                    height: 38px;
+                    placeholder-text: "Paste YouTube cookie header to sign in…";
+                    font-size: 13px;
+                }
+                HorizontalLayout {
+                    alignment: start;
+                    TabPill {
+                        label: "Sign in";
+                        active: true;
+                        clicked => { root.sign-in(cookie-input.text); }
+                    }
+                }
             }
         }
     }
@@ -2046,7 +2077,7 @@ component PlayerBar inherits Rectangle {
 // ——— Root window ————————————————————————————————————————————————————
 
 export component ZunoWindow inherits Window {
-    title: "Zuno";
+    title: "Zuno (Slint)";
     preferred-width: 1280px;
     preferred-height: 800px;
     min-width: 900px;
@@ -2091,6 +2122,7 @@ export component ZunoWindow inherits Window {
     // ——— search ———
     in-out property <string> search-query: "";
     in property <bool> search-has-query: false;
+    in property <bool> search-live: false;
     in property <[CardData]> search-top;
     in property <[TrackRow]> search-songs;
     in property <[CardData]> search-albums;
@@ -2120,6 +2152,10 @@ export component ZunoWindow inherits Window {
 
     // ——— selection (bench + UI) ———
     in property <int> selected-index: -1;
+
+    // ——— real YouTube (wiring; bench mode never sets these) ———
+    in property <string> yt-status: "";
+    callback sign-in(string);
 
     // ——— callbacks to Rust ———
     callback nav-home();
@@ -2286,6 +2322,7 @@ export component ZunoWindow inherits Window {
                     visible: root.page == PageTag.search;
                     query-text <=> root.search-query;
                     has-query: root.search-has-query;
+                    live: root.search-live;
                     top: root.search-top;
                     songs: root.search-songs;
                     albums: root.search-albums;
@@ -2301,6 +2338,8 @@ export component ZunoWindow inherits Window {
 
                 if root.page == PageTag.settings : SettingsPage {
                     x: 0; y: 0; width: 100%; height: 100%;
+                    yt-status: root.yt-status;
+                    sign-in(t) => { root.sign-in(t); }
                 }
 
                 if root.queue-open : QueuePanel {

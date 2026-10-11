@@ -197,3 +197,157 @@ $ ldd target/release/zuno-slint | grep -icE "webkit|gtk|cef|chromium|electron"
 - Nine threads total (main + winit + GL + cpal/rodio audio); peak RSS
   153–158 MB including the GL context, the full library model, and the
   startup artwork set.
+
+## Real-YouTube wiring (2026-10-11)
+
+`gui/slint` now consumes `native/yt` (`zuno-yt`) live, `--bench` stays
+synthetic. Everything below was measured on this machine in one live session
+(2026-10-11, unsigned — no cookie pasted).
+
+### Async runtime choice
+
+Slint owns the UI thread (`Rc<RefCell<Zuno>>` is `!Send`), so there is no
+background runtime shared with the UI. Instead every network call spawns a
+**short-lived `std::thread` that builds its own current-thread tokio
+runtime** (`tokio::runtime::Builder::new_current_thread().enable_all()`,
+created and dropped inside the worker), does the blocking `zuno-yt` call,
+and posts one `YtMsg` over a `std::sync::mpsc` channel. The existing 16 ms
+`slint::Timer` tick drains the channel on the UI thread and applies results
+(models swap in place, `VecModel`s are not replaced, scroll positions
+survive). No locks, no cross-thread UI access, no `Send` violation.
+Artwork batches fan out further (6-way `std::thread::scope`) so one slow
+thumbnail doesn't stall a batch; bytes go through
+`ArtworkCache::insert_bytes` on the UI thread, so first paint of real data
+already has covers and `get_url` never blocks on the network for warmed
+URLs. `--bench` never spawns a worker and `apply_yt` early-returns — the
+bench path is behaviorally byte-identical (verified below).
+
+### What loads live, and when
+
+- **First paint**: instant, synthetic (`AppState::new()`) — the window is
+  interactive immediately.
+- **Real home**: `YtClient::unsigned() → get_home() → YtLibrary::from_home`
+  swaps `app.library` a few seconds after launch (over the network; on this
+  session: **5 shelves, 20 real tracks**, plus the chart-playlist "mixes"
+  shelf rebuilt from the raw home response). Status line in Settings shows
+  "YouTube live — N tracks"; on failure the synthetic library is kept and
+  the honest error is shown.
+- **Artwork**: real covers for every track/album/artist/playlist with a
+  `artwork_url` (network fetch on workers, decoded through the same 96-cover
+  LRU); the procedural `get(seed, size)` tile stays the per-widget fallback
+  for `--bench`, offline, and missing URLs.
+- **Search**: the existing box is wired live — 300 ms debounce,
+  generation-counted requests, stale generations dropped on arrival.
+  Observed live: typing "pink floyd time" produced interleaved fetches for
+  the intermediate states (`"[ink": 15 tracks`, `"pinkflo": 14`,
+  `"pin": 11`, `"pink": 14`) — real YouTube Music results, with only the
+  newest generation applied.
+- **Playback**: a track with `video_id` resolves through
+  `zuno_yt::resolve_stream_url` and plays via `PlayerHandle::play_stream`;
+  synth playback stays for `--bench` and for tracks without a `video_id`.
+  Queue advance/seek/volume all keep working through the same `PlayerHandle`
+  (stream-aware `next/prev/toggle/seek` mirror `AppState`'s repeat policy).
+- **Sign-in**: Settings has a "Paste YouTube cookie header" field →
+  `Session::import` → `YtClient::with_session` → `get_library()`; the
+  session persists to disk (`Session::save/load`, plain JSON) and reloads on
+  startup, likes fire `set_track_rating` best-effort. Unsigned mode keeps
+  everything public working. Not exercised live here (no cookie to paste).
+
+### Streaming throttling — what we actually observed
+
+Exactly the documented server-side gate (`docs/gui-benchmarks/yt.md`,
+"Streaming throttling"): a **rolling per-IP byte budget without a PO
+token**. Playing the live search results drove **21 real stream resolves
+(20 distinct video ids, audio/mp4 ~130 kbps, iOS client first every time) —
+resolution succeeded 21/21**. Every download then behaved identically:
+the first 1 MiB ranged chunk succeeded (bytes 0–1048576 arrived), the
+second chunk 403'd (`stream range 1048576 failed (stream HTTP 403
+Forbidden), falling back to whole-file`), the whole-file GET 403'd too, and
+core's all-or-nothing downloader reported `stream download failed` — so no
+audio was audible on this IP at test time (the budget was already spent
+before the first playback — the very first track's second chunk 403'd
+immediately — and the 20-track queue advance kept re-spending it as it
+partially reset between attempts; observed failed-chunk offsets varied:
+1048576, 1101584, 564937, 592216, 677689, 766558). The wiring did the right
+thing throughout: `play_stream` was called with the real URL/mime, a failed
+download *ends* the track, the queue advanced cleanly track-to-track with
+no hang, no crash, and no infinite retry. Full-track playback will be
+audible whenever the budget allows it (quiet network/different egress) —
+the gate is policy (attestation), not downloader engineering.
+
+### `--bench` comparability (back-to-back, same machine/session)
+
+The old absolute number (153 MB) is no longer reachable in the same
+binary: the required `zuno-yt` dependency is now *linked into the bench
+binary*. To prove no leak, both binaries were benched back-to-back under
+identical conditions (window visible, ~48 s schedule each):
+
+| binary | peak RSS (VmHWM) | runs |
+|---|---:|---|
+| pre-wiring (`git stash` build) | **152.6 / 154.4 MB** | matches the 2026-10-08 baseline (153.2/158.2) |
+| wired (this branch) | **158.8 / 160.2 / 160.5 MB** | delta ≈ **+6 MB** |
+
+`smaps_rollup` mid-run: the wired build's extra RSS is **file-backed**
+(Pss_File 84.0 → 86.2 MB; Pss_Anon 42.1 → 43.3 MB at t=10 s — a heap leak
+would grow anon and keep growing; scroll→select→playback stay flat at
++0.9 MB over the run in both builds). The +6 MB is the linked-in
+`zuno-yt` machinery (QuickJS/rquickjs decipher tables + reqwest/rustls +
+tokio code pages; binary 37.5 → 40.2 MB) being touched by relocations at
+startup, not a behavioral change: in `--bench` the wiring never spawns a
+worker, never loads a session, never touches the network, and the tick
+only gains an empty-channel `try_recv` plus two early-return checks.
+
+Fresh wired `--bench` table (the one to compare against future runs):
+
+| phase | samples | RSS mean | RSS min | RSS max |
+|-------|---------:|--------:|--------:|--------:|
+| startup (first frame + library) | 1 | 123.2 MB | 123.2 MB | 123.2 MB |
+| idle | 7 | 150.1 MB | 123.2 MB | 154.7 MB |
+| scroll | 20 | 159.3 MB | 158.8 MB | 159.6 MB |
+| select | 5 | 159.6 MB | 159.6 MB | 159.6 MB |
+| playback | 15 | 160.2 MB | 160.2 MB | 160.2 MB |
+
+- Peak RSS (VmHWM): 160.2 MB
+- CPU: 4.9s over 48s wall (10% of one core)
+- Threads at exit: 9
+
+The scroll delta (+4.7 MB) and the delegate-pool behavior are unchanged —
+the virtualization conclusions above all still hold.
+
+### Honest gaps from this session (for the next evaluator)
+
+- **The album-card click path was not exercised live.** Live-verified:
+  home load, artwork, search (with debounce/stale-drop), stream
+  playback-attempt through `play_stream`, queue advance over the 403s.
+  `open_album_yt` (card click → `get_album` network fetch → detail page) is
+  the one trigger not driven by a real click: this is an *actively used*
+  session and the input-injection tools below never landed a click on our
+  window. Its parts are individually proven (`get_album` is live-tested in
+  the `zuno-yt` online suite; the worker+apply pipeline is the same
+  `spawn_*/apply_*` shape as the live-proven search path).
+- **Input injection on this compositor, measured**: `wtype` (zwp virtual
+  keyboard) works — all typing/search/Space playback above was driven
+  with it. A `zwlr_virtual_pointer` client (built ad hoc against
+  `wayland-client` + `wayland-protocols-wlr`, requests verified present via
+  `WAYLAND_DEBUG` — `motion_absolute`+`frame` after
+  `create_virtual_pointer_with_output`) never moved niri 26.04's cursor onto
+  our window under either candidate mapping (output-relative or global
+  union rect), so absolute mouse automation on this setup is unreliable;
+  relative `ydotool` motion goes through pointer acceleration and can't be
+  positioned blind. The `game-automation` skill's window capture + input
+  route (or AT-SPI action activation — the Slint accessibility feature is
+  enabled) is the recommended way to script clicks here.
+- niri window management notes from this session: focus must be re-verified
+  before every `wtype` batch (an active browser session steals it within
+  seconds), `screenshot-window` captures whatever is *focused* (verify the
+  PNG size against the window's), floating windows get dragged around by
+  the user mid-test, and `niri msg windows`' "Workspace-view position" is
+  the position hint that matched our pixel measurements.
+
+### Screenshot
+
+`docs/gui-benchmarks/slint-yt-home.png` — the live home view (real
+shelves/artwork) captured with `niri msg action screenshot-window` during
+the live session; the `[yt] home live: 20 tracks` log line precedes the
+capture, and the image carries 204k distinct colors (procedural covers
+produce hundreds).

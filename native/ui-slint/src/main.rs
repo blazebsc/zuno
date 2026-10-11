@@ -10,7 +10,9 @@ slint::include_modules!();
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::time::Duration;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::thread;
+use std::time::{Duration, Instant};
 use slint::Model;
 use zuno_core::app::{LibraryTab, RepeatMode};
 use zuno_core::bench::{BenchAction, BenchDriver};
@@ -19,6 +21,10 @@ use zuno_core::model::*;
 use zuno_core::queue::Region;
 use zuno_core::search;
 use zuno_core::{AppState, View};
+use zuno_yt::{
+    Rating, Session, YtAlbum, YtArtist, YtClient, YtClientExt, YtHome, YtLibrary, YtMutations,
+    YtPlaylist, YtPlaylistHeader, YtSearchResults, YtTrack,
+};
 
 /// A card source before it becomes `CardData` (art filled on demand).
 #[derive(Clone)]
@@ -29,6 +35,8 @@ struct CardSpec {
     subtitle: String,
     round: bool,
     seed: u64,
+    /// Remote cover URL in live-YouTube mode; `None` = procedural cover.
+    art_url: Option<String>,
 }
 
 /// Which chunked grid a callback refers to.
@@ -47,9 +55,299 @@ struct Grid {
     cols: usize,
 }
 
+// ——— real-YouTube background plumbing ———————————————————————————
+// Slint owns the UI thread (`Rc<RefCell<Zuno>>` is !Send), so every network
+// call runs on a short-lived worker thread with its own client +
+// current-thread tokio runtime, and posts a `YtMsg` back. The 16 ms `tick`
+// drains the channel — no locks, no cross-thread UI access. `--bench`
+// never spawns and never applies: the bench path is byte-identical.
+
+/// Fetched-then-decode-on-UI artwork: (url, size, bytes). The worker does
+/// network only (`fetch_artwork`); the UI thread runs `insert_bytes` (the
+/// network-free half of `get_url`) before rebuilding models, so first
+/// paint of real data already has covers and the UI thread never blocks
+/// on the network for warmed URLs.
+type ArtBatch = Vec<(String, u32, Vec<u8>)>;
+
+enum YtMsg {
+    Home { home: YtHome, mixes: Vec<YtPlaylistHeader>, art: ArtBatch },
+    HomeFailed(String),
+    Search { gen: u64, results: YtSearchResults, art: ArtBatch },
+    SearchFailed { gen: u64, err: String },
+    DetailAlbum { album: YtAlbum, art: ArtBatch },
+    DetailArtist { artist: YtArtist, art: ArtBatch },
+    DetailPlaylist { id: String, title: String, tracks: Vec<YtTrack>, art: ArtBatch },
+    DetailFailed(String),
+    Stream { id: TrackId, url: String, mime: String },
+    StreamFailed { id: TrackId },
+    SignedIn { session: Session, home: YtHome, mixes: Vec<YtPlaylistHeader>, art: ArtBatch },
+    SignInFailed(String),
+}
+
+fn yt_client(cookie: Option<&str>) -> Result<YtClient, String> {
+    match cookie {
+        Some(c) if !c.trim().is_empty() => {
+            let mut s = Session::default();
+            s.cookie_header = c.to_string();
+            YtClient::with_session(s).map_err(|e| e.to_string())
+        }
+        _ => YtClient::unsigned().map_err(|e| e.to_string()),
+    }
+}
+
+fn yt_rt() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("yt runtime")
+}
+
+/// Distinct track artwork urls, first-seen order.
+fn track_art_urls(tracks: &[YtTrack]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for t in tracks {
+        if let Some(u) = t.artwork_url() {
+            if seen.insert(u) {
+                out.push(u.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Blocking thumb fetch on a worker thread, fanned out so one slow thumb
+/// doesn't stall the batch. Failures are dropped: `get_url`'s procedural
+/// fallback covers them at paint time.
+fn yt_fetch_art(plans: &[(String, u32)]) -> ArtBatch {
+    if plans.is_empty() {
+        return Vec::new();
+    }
+    let out = std::sync::Mutex::new(Vec::new());
+    let n = plans.len().div_ceil(6).max(1);
+    std::thread::scope(|s| {
+        for chunk in plans.chunks(n) {
+            let out = &out;
+            s.spawn(move || {
+                let mut got = Vec::new();
+                for (url, size) in chunk {
+                    if let Ok(bytes) = zuno_yt::fetch_artwork(url) {
+                        got.push((url.clone(), *size, bytes));
+                    }
+                }
+                out.lock().unwrap().extend(got);
+            });
+        }
+    });
+    out.into_inner().unwrap()
+}
+
+/// Warm plan for a home-sized track set: cards at 176, rows at 40.
+fn home_art_plans(tracks: &[YtTrack], mixes: &[YtPlaylistHeader]) -> Vec<(String, u32)> {
+    let urls = track_art_urls(tracks);
+    let mut plans = Vec::new();
+    for u in urls.iter().take(12) {
+        plans.push((u.clone(), 176));
+    }
+    for u in urls.iter().take(24) {
+        plans.push((u.clone(), 40));
+    }
+    for m in mixes.iter().take(12) {
+        if let Some(u) = zuno_yt::pick_artwork(&m.thumbnails) {
+            plans.push((u.to_string(), 176));
+        }
+    }
+    plans
+}
+
+fn mixes_of(home: &YtHome) -> Vec<YtPlaylistHeader> {
+    home.shelves
+        .iter()
+        .flat_map(|s| s.playlists.iter().cloned())
+        .take(12)
+        .collect()
+}
+
+fn home_tracks_of(home: &YtHome) -> Vec<YtTrack> {
+    // Same expression `YtLibrary::from_home` builds from — ids stay parallel.
+    home.shelves.iter().flat_map(|s| s.tracks.clone()).collect()
+}
+
+fn spawn_home_load(tx: Sender<YtMsg>, cookie: Option<String>) {
+    thread::spawn(move || {
+        let msg = match yt_client(cookie.as_deref()) {
+            Err(e) => YtMsg::HomeFailed(e),
+            Ok(mut yt) => match yt_rt().block_on(yt.get_home()) {
+                Err(e) => YtMsg::HomeFailed(e.to_string()),
+                Ok(home) => {
+                    let tracks = home_tracks_of(&home);
+                    let mixes = mixes_of(&home);
+                    let art = yt_fetch_art(&home_art_plans(&tracks, &mixes));
+                    eprintln!("[yt] home: {} shelves, {} tracks", home.shelves.len(), tracks.len());
+                    YtMsg::Home { home, mixes, art }
+                }
+            },
+        };
+        let _ = tx.send(msg);
+    });
+}
+
+fn spawn_search(tx: Sender<YtMsg>, cookie: Option<String>, gen: u64, q: String) {
+    thread::spawn(move || {
+        let msg = match yt_client(cookie.as_deref()) {
+            Err(e) => YtMsg::SearchFailed { gen, err: e },
+            Ok(mut yt) => match yt_rt().block_on(yt.search(&q)) {
+                Err(e) => YtMsg::SearchFailed { gen, err: e.to_string() },
+                Ok(results) => {
+                    let urls = track_art_urls(&results.tracks);
+                    let mut plans: Vec<(String, u32)> = Vec::new();
+                    for u in urls.iter().take(10) {
+                        plans.push((u.clone(), 176));
+                    }
+                    for u in urls.iter().take(20) {
+                        plans.push((u.clone(), 40));
+                    }
+                    let art = yt_fetch_art(&plans);
+                    eprintln!("[yt] search {q:?}: {} tracks", results.tracks.len());
+                    YtMsg::Search { gen, results, art }
+                }
+            },
+        };
+        let _ = tx.send(msg);
+    });
+}
+
+fn spawn_album(tx: Sender<YtMsg>, cookie: Option<String>, browse_id: String) {
+    thread::spawn(move || {
+        let msg = match yt_client(cookie.as_deref()) {
+            Err(e) => YtMsg::DetailFailed(e),
+            Ok(mut yt) => match yt_rt().block_on(yt.get_album(&browse_id)) {
+                Err(e) => YtMsg::DetailFailed(format!("album: {e}")),
+                Ok(album) => {
+                    let urls = track_art_urls(&album.tracks);
+                    let mut plans: Vec<(String, u32)> = urls
+                        .iter()
+                        .take(24)
+                        .map(|u| (u.clone(), 40))
+                        .collect();
+                    if let Some(u) = zuno_yt::pick_artwork(&album.thumbnails) {
+                        plans.push((u.to_string(), 232));
+                    }
+                    let art = yt_fetch_art(&plans);
+                    eprintln!("[yt] album {:?} ({} tracks)", album.title, album.tracks.len());
+                    YtMsg::DetailAlbum { album, art }
+                }
+            },
+        };
+        let _ = tx.send(msg);
+    });
+}
+
+fn spawn_artist(tx: Sender<YtMsg>, cookie: Option<String>, channel_id: String) {
+    thread::spawn(move || {
+        let msg = match yt_client(cookie.as_deref()) {
+            Err(e) => YtMsg::DetailFailed(e),
+            Ok(mut yt) => match yt_rt().block_on(yt.get_artist(&channel_id)) {
+                Err(e) => YtMsg::DetailFailed(format!("artist: {e}")),
+                Ok(artist) => {
+                    let urls = track_art_urls(&artist.top_tracks);
+                    let mut plans: Vec<(String, u32)> = urls
+                        .iter()
+                        .take(24)
+                        .map(|u| (u.clone(), 40))
+                        .collect();
+                    if let Some(u) = zuno_yt::pick_artwork(&artist.thumbnails) {
+                        plans.push((u.to_string(), 232));
+                    }
+                    for a in artist.albums.iter().take(12) {
+                        if let Some(u) = zuno_yt::pick_artwork(&a.thumbnails) {
+                            plans.push((u.to_string(), 176));
+                        }
+                    }
+                    let art = yt_fetch_art(&plans);
+                    eprintln!("[yt] artist {:?} ({} top tracks)", artist.name, artist.top_tracks.len());
+                    YtMsg::DetailArtist { artist, art }
+                }
+            },
+        };
+        let _ = tx.send(msg);
+    });
+}
+
+fn spawn_playlist(tx: Sender<YtMsg>, cookie: Option<String>, id: String, title: String) {
+    thread::spawn(move || {
+        let msg = match yt_client(cookie.as_deref()) {
+            Err(e) => YtMsg::DetailFailed(e),
+            Ok(mut yt) => {
+                // Whole list — pagination + termination guard inside.
+                match yt_rt().block_on(yt.get_playlist_tracks(&id)) {
+                    Err(e) => YtMsg::DetailFailed(format!("playlist: {e}")),
+                    Ok(tracks) => {
+                        let urls = track_art_urls(&tracks);
+                        let plans: Vec<(String, u32)> = urls
+                            .iter()
+                            .take(24)
+                            .map(|u| (u.clone(), 40))
+                            .collect();
+                        let art = yt_fetch_art(&plans);
+                        eprintln!("[yt] playlist {title:?} ({} tracks)", tracks.len());
+                        YtMsg::DetailPlaylist { id, title, tracks, art }
+                    }
+                }
+            }
+        };
+        let _ = tx.send(msg);
+    });
+}
+
+fn spawn_stream(tx: Sender<YtMsg>, cookie: Option<String>, id: TrackId, video_id: String) {
+    thread::spawn(move || {
+        let r = yt_client(cookie.as_deref()).and_then(|mut yt| {
+            yt_rt()
+                .block_on(zuno_yt::resolve_stream_url(&mut yt, &video_id))
+                .map_err(|e| e.to_string())
+        });
+        let msg = match r {
+            Ok(info) => {
+                eprintln!("[yt] stream {video_id}: {} {}kbps", info.mime, info.bitrate / 1000);
+                YtMsg::Stream { id, url: info.url, mime: info.mime }
+            }
+            Err(e) => {
+                eprintln!("[yt] resolve failed for {video_id}: {e}");
+                YtMsg::StreamFailed { id }
+            }
+        };
+        let _ = tx.send(msg);
+    });
+}
+
+fn spawn_sign_in(tx: Sender<YtMsg>, paste: String) {
+    thread::spawn(move || {
+        let session = Session::import(&paste);
+        if session.is_empty() {
+            let _ = tx.send(YtMsg::SignInFailed("Paste a YouTube Cookie header first.".into()));
+            return;
+        }
+        let msg = match YtClient::with_session(session.clone()) {
+            Err(e) => YtMsg::SignInFailed(e.to_string()),
+            Ok(mut yt) => match yt_rt().block_on(yt.get_library()) {
+                Err(e) => YtMsg::SignInFailed(format!("Library load failed: {e}")),
+                Ok(home) => {
+                    let tracks = home_tracks_of(&home);
+                    let mixes = mixes_of(&home);
+                    let art = yt_fetch_art(&home_art_plans(&tracks, &mixes));
+                    YtMsg::SignedIn { session, home, mixes, art }
+                }
+            },
+        };
+        let _ = tx.send(msg);
+    });
+}
+
 struct Zuno {
     state: AppState,
     art: HashMap<(u64, u32), slint::Image>,
+    url_art: HashMap<(String, u32), slint::Image>,
     ui: ZunoWindow,
 
     home_recent: Rc<slint::VecModel<CardData>>,
@@ -82,16 +380,39 @@ struct Zuno {
     window_w: f32,
     queue_open: bool,
     bench: Option<BenchDriver>,
+
+    // ——— real-YouTube wiring (all dead in `--bench`) ———
+    yt_tx: Sender<YtMsg>,
+    yt_rx: Receiver<YtMsg>,
+    /// Home data swapped in: search/play/detail go to the network.
+    yt_live: bool,
+    yt_loading: bool,
+    session: Option<Session>,
+    /// Raw YT tracks parallel to `state.library.tracks` (same order — the
+    /// `YtLibrary` adapters assign sequential ids). Empty in synth mode.
+    /// Lets card clicks recover browse/channel ids the adapter drops.
+    yt_tracks: Vec<YtTrack>,
+    /// Chart-playlist headers behind the home mixes shelf (id order matches
+    /// the `home_mixes` cards); the swapped library carries no mixes.
+    yt_mixes: Vec<YtPlaylistHeader>,
+    /// YT playlist id behind the current single-playlist library, if any.
+    yt_pl_id: Option<String>,
+    /// Raw home data to restore when leaving search/detail views
+    /// (rebuilt deterministically — the art cache already holds covers).
+    yt_home: Option<(YtHome, Vec<YtPlaylistHeader>)>,
+    search_gen: u64,
+    search_at: Option<Instant>,
+    search_q: String,
+    /// List a stream play started from (Repeat::All wrap target).
+    yt_source: Vec<TrackId>,
+    yt_status: String,
 }
 
 impl Zuno {
     fn new(ui: ZunoWindow) -> Self {
         let state = AppState::new();
-        let bench = if std::env::args().any(|a| a == "--bench") {
-            Some(BenchDriver::new())
-        } else {
-            None
-        };
+        let bench = std::env::args().any(|a| a == "--bench");
+        let (yt_tx, yt_rx) = channel::<YtMsg>();
         let empty_grid = || Grid {
             specs: Vec::new(),
             rows: Rc::new(slint::VecModel::default()),
@@ -101,6 +422,7 @@ impl Zuno {
         let mut z = Zuno {
             state,
             art: HashMap::new(),
+            url_art: HashMap::new(),
             ui,
             home_recent: Rc::new(slint::VecModel::default()),
             home_mixes: Rc::new(slint::VecModel::default()),
@@ -124,11 +446,61 @@ impl Zuno {
             last_liked: false,
             window_w: 1280.0,
             queue_open: false,
-            bench,
+            bench: bench.then(BenchDriver::new),
+            yt_tx,
+            yt_rx,
+            yt_live: false,
+            yt_loading: false,
+            session: None,
+            yt_tracks: Vec::new(),
+            yt_mixes: Vec::new(),
+            yt_pl_id: None,
+            yt_home: None,
+            search_gen: 0,
+            search_at: None,
+            search_q: String::new(),
+            yt_source: Vec::new(),
+            yt_status: String::new(),
         };
         z.build_static_models();
         z.connect_models();
+        // Synthetic first paint stays; real home loads in the background.
+        // `--bench` never spawns: same library, same synth, same numbers.
+        if bench {
+            return z;
+        }
+        let saved = Session::load();
+        if let Some(ref s) = saved {
+            if !s.is_empty() {
+                z.session = saved;
+                let who = z
+                    .session
+                    .as_ref()
+                    .and_then(|s| s.account_identity())
+                    .map(|id| format!(" ({}…)", &id[..id.len().min(6)]))
+                    .unwrap_or_default();
+                z.set_yt_status(format!("Signed in{who} — loading home…"));
+            }
+        }
+        if z.yt_status.is_empty() {
+            z.set_yt_status("Connecting to YouTube Music…".to_string());
+        }
+        z.yt_loading = true;
+        spawn_home_load(z.yt_tx.clone(), z.cookie());
         z
+    }
+
+    fn is_bench(&self) -> bool {
+        self.bench.is_some()
+    }
+
+    fn cookie(&self) -> Option<String> {
+        self.session.as_ref().map(|s| s.cookie_header.clone())
+    }
+
+    fn set_yt_status(&mut self, s: String) {
+        self.yt_status = s.clone();
+        self.ui.set_yt_status(s.into());
     }
 
     /// Hand the shared VecModels to the window as `ModelRc` properties —
@@ -182,11 +554,56 @@ impl Zuno {
         Self::art_of(&self.state, &mut self.art, seed, size)
     }
 
+    /// Remote cover via the shared cache (`get_url` — same 96-cover LRU;
+    /// any fetch/decode failure falls back to the procedural tile, so
+    /// callers never branch on network state). Cache-hit fast; call sites
+    /// warm the cache on a worker thread before first display.
+    fn art_url_of(
+        state: &AppState,
+        map: &mut HashMap<(String, u32), slint::Image>,
+        url: &str,
+        size: u32,
+    ) -> slint::Image {
+        let key = (url.to_string(), size);
+        if let Some(img) = map.get(&key) {
+            return img.clone();
+        }
+        let rgba = state.artwork.get_url(url, size);
+        let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+            rgba.as_slice(),
+            size,
+            size,
+        );
+        let img = slint::Image::from_rgba8(buf);
+        map.insert(key, img.clone());
+        img
+    }
+
+    fn art_url(&mut self, url: &str, size: u32) -> slint::Image {
+        Self::art_url_of(&self.state, &mut self.url_art, url, size)
+    }
+
+    /// Row/card art: remote URL when the track has one (live mode),
+    /// procedural seed otherwise (synth/`--bench`/missing URL).
+    fn track_art(&mut self, id: TrackId, size: u32) -> slint::Image {
+        let (url, seed) = {
+            let t = self.state.library.track(id);
+            (
+                t.artwork_url.clone(),
+                AppState::album_seed(t.album_id),
+            )
+        };
+        match url {
+            Some(u) => self.art_url(&u, size),
+            None => self.art(seed, size),
+        }
+    }
+
     // ——— row builders ————————————————————————————————————————————————
 
     fn track_row(&mut self, id: TrackId) -> TrackRow {
+        let art = self.track_art(id, 40);
         let v = self.state.library.track_view(id);
-        let seed = AppState::album_seed(self.state.library.track(id).album_id);
         TrackRow {
             id: id as i32,
             title: v.title.into(),
@@ -194,18 +611,22 @@ impl Zuno {
             duration: mmss(v.duration_sec).into(),
             explicit: v.explicit,
             liked: v.liked,
-            art: self.art(seed, 40),
+            art,
         }
     }
 
     fn filled_card(&mut self, spec: &CardSpec, size: u32) -> CardData {
+        let art = match &spec.art_url {
+            Some(u) => self.art_url(u, size),
+            None => self.art(spec.seed, size),
+        };
         CardData {
             id: spec.id as i32,
             kind: spec.kind,
             title: spec.title.clone().into(),
             subtitle: spec.subtitle.clone().into(),
             round: spec.round,
-            art: self.art(spec.seed, size),
+            art,
             needs_art: false,
         }
     }
@@ -213,13 +634,20 @@ impl Zuno {
     fn album_spec(&self, id: AlbumId) -> CardSpec {
         let album = self.state.library.album(id);
         let artist = self.state.library.artist(album.artist_id);
+        // YouTube leaves year unknown (0) — don't print it.
+        let subtitle = if album.year == 0 {
+            artist.name.clone()
+        } else {
+            format!("{} · {}", artist.name, album.year)
+        };
         CardSpec {
             id,
             kind: 0,
             title: album.title.clone(),
-            subtitle: format!("{} · {}", artist.name, album.year),
+            subtitle,
             round: false,
             seed: AppState::album_seed(id),
+            art_url: album.artwork_url.clone(),
         }
     }
 
@@ -232,6 +660,7 @@ impl Zuno {
             subtitle: listeners(a.monthly_listeners),
             round: true,
             seed: AppState::artist_seed(id),
+            art_url: a.artwork_url.clone(),
         }
     }
 
@@ -244,6 +673,7 @@ impl Zuno {
             subtitle: p.description.clone().unwrap_or_else(|| "Made for you".into()),
             round: false,
             seed: AppState::playlist_seed(id),
+            art_url: p.artwork_url.clone(),
         }
     }
 
@@ -309,15 +739,41 @@ impl Zuno {
             recent_specs.iter().map(|s| self.filled_card(s, 176)).collect();
         self.home_recent.set_vec(recent);
 
-        let mix_specs: Vec<CardSpec> = self
-            .state
-            .library
-            .mixes
+        let mix_specs: Vec<CardSpec> = if self.yt_live {
+            // The swapped library carries no mixes; chart playlists come
+            // from the raw home shelves (card ids index `yt_mixes` below).
+            self.yt_mixes
+                .iter()
+                .map(|m| CardSpec {
+                    id: 0,
+                    kind: 2,
+                    title: m.title.clone(),
+                    subtitle: "Playlist · YouTube Music".to_string(),
+                    round: false,
+                    seed: 0,
+                    art_url: zuno_yt::pick_artwork(&m.thumbnails).map(str::to_string),
+                })
+                .collect()
+        } else {
+            self.state
+                .library
+                .mixes
+                .iter()
+                .map(|m| self.playlist_spec(m.id))
+                .collect()
+        };
+        // Mix card ids index `yt_mixes` in live mode (see `open_mix_yt`).
+        let mixes: Vec<CardData> = mix_specs
             .iter()
-            .map(|m| self.playlist_spec(m.id))
+            .enumerate()
+            .map(|(i, s)| {
+                let mut s = s.clone();
+                if self.yt_live {
+                    s.id = i as u32;
+                }
+                self.filled_card(&s, 176)
+            })
             .collect();
-        let mixes: Vec<CardData> =
-            mix_specs.iter().map(|s| self.filled_card(s, 176)).collect();
         self.home_mixes.set_vec(mixes);
 
         let mut artist_ids: Vec<ArtistId> = (0..self.state.library.artists.len() as u32).collect();
@@ -340,8 +796,8 @@ impl Zuno {
             new_ids.iter().map(|&a| self.album_spec(a)).collect();
         self.chunk_grid(GridSlot::HomeNew);
 
-        // Sidebar + Library ▸ Playlists (id, title, count, seed) then rows.
-        let pl_info: Vec<(PlaylistId, String, u64)> = self
+        // Sidebar + Library ▸ Playlists (id, title, count, seed, art) then rows.
+        let pl_info: Vec<(PlaylistId, String, u64, Option<String>)> = self
             .state
             .library
             .playlists
@@ -351,51 +807,74 @@ impl Zuno {
                     p.id,
                     count_songs(p.track_ids.len()),
                     AppState::playlist_seed(p.id),
+                    p.artwork_url.clone(),
                 )
             })
             .collect();
         let sidebar: Vec<PlaylistRowData> = pl_info
             .iter()
-            .map(|&(id, ref sub, seed)| {
-                let p = self.state.library.playlist(id).unwrap();
+            .map(|&(id, ref sub, seed, ref art_url)| {
+                let title = self.state.library.playlist(id).unwrap().title.clone();
+                let art = match art_url {
+                    Some(u) => self.art_url(u, 40),
+                    None => self.art(seed, 40),
+                };
                 PlaylistRowData {
                     id: id as i32,
-                    title: p.title.clone().into(),
+                    title: title.into(),
                     sub: sub.clone().into(),
-                    art: self.art(seed, 40),
+                    art,
                 }
             })
             .collect();
         self.sidebar_playlists.set_vec(sidebar);
         let lib_pl: Vec<PlaylistRowData> = pl_info
             .iter()
-            .map(|&(id, _, seed)| {
+            .map(|&(id, _, seed, ref art_url)| {
                 let p = self.state.library.playlist(id).unwrap();
+                let title = p.title.clone();
+                let counts = count_songs(p.track_ids.len());
+                let art = match art_url {
+                    Some(u) => self.art_url(u, 40),
+                    None => self.art(seed, 40),
+                };
                 PlaylistRowData {
                     id: id as i32,
-                    title: p.title.clone().into(),
-                    sub: format!("{} · playlist", count_songs(p.track_ids.len())).into(),
-                    art: self.art(seed, 40),
+                    title: title.into(),
+                    sub: format!("{} · playlist", counts).into(),
+                    art,
                 }
             })
             .collect();
         self.lib_playlists.set_vec(lib_pl);
 
         // Library ▸ Artists.
-        let artist_info: Vec<(ArtistId, String, String, u64)> = (0
+        let artist_info: Vec<(ArtistId, String, String, u64, Option<String>)> = (0
             ..self.state.library.artists.len() as u32)
             .map(|id| {
                 let a = self.state.library.artist(id);
-                (id, a.name.clone(), listeners(a.monthly_listeners), AppState::artist_seed(id))
+                (
+                    id,
+                    a.name.clone(),
+                    listeners(a.monthly_listeners),
+                    AppState::artist_seed(id),
+                    a.artwork_url.clone(),
+                )
             })
             .collect();
         let artists: Vec<ArtistRowData> = artist_info
             .iter()
-            .map(|&(id, ref name, ref sub, seed)| ArtistRowData {
-                id: id as i32,
-                name: name.clone().into(),
-                sub: sub.clone().into(),
-                art: self.art(seed, 40),
+            .map(|&(id, ref name, ref sub, seed, ref art_url)| {
+                let art = match art_url {
+                    Some(u) => self.art_url(u, 40),
+                    None => self.art(seed, 40),
+                };
+                ArtistRowData {
+                    id: id as i32,
+                    name: name.clone().into(),
+                    sub: sub.clone().into(),
+                    art,
+                }
             })
             .collect();
         self.lib_artists.set_vec(artists);
@@ -420,8 +899,8 @@ impl Zuno {
         // touch `self.art` / models (&mut).
         enum Hero {
             None,
-            Collection { seed: u64, kind: String, title: String, sub: String, counts: String, round: bool },
-            Artist { seed: u64, name: String, listeners: String, counts: String, top: Vec<TrackId>, album_specs: Vec<CardSpec> },
+            Collection { seed: u64, art_url: Option<String>, kind: String, title: String, sub: String, counts: String, round: bool },
+            Artist { seed: u64, art_url: Option<String>, name: String, listeners: String, counts: String, top: Vec<TrackId>, album_specs: Vec<CardSpec> },
         }
         let hero = match self.state.view.clone() {
             View::Album(id) => {
@@ -433,6 +912,7 @@ impl Zuno {
                 );
                 Hero::Collection {
                     seed: AppState::album_seed(id),
+                    art_url: album.artwork_url.clone(),
                     kind: album.kind.label().to_string(),
                     title: album.title.clone(),
                     sub: format!("Album · {}", artist.name),
@@ -448,6 +928,7 @@ impl Zuno {
                 );
                 Hero::Collection {
                     seed: AppState::playlist_seed(id),
+                    art_url: p.artwork_url.clone(),
                     kind: "Playlist".into(),
                     title: p.title.clone(),
                     sub: format!(
@@ -477,6 +958,7 @@ impl Zuno {
                     a.album_ids.iter().map(|&aid| self.album_spec(aid)).collect();
                 Hero::Artist {
                     seed: AppState::artist_seed(id),
+                    art_url: a.artwork_url.clone(),
                     name: a.name.clone(),
                     listeners: listeners(a.monthly_listeners),
                     counts,
@@ -500,8 +982,12 @@ impl Zuno {
             View::Artist(_) => self.ui.set_page(PageTag::Artist),
         }
         match hero {
-            Hero::Collection { seed, kind, title, sub, counts, round } => {
-                self.ui.set_hero_art(Self::art_of(&self.state, &mut self.art, seed, 232));
+            Hero::Collection { seed, art_url, kind, title, sub, counts, round } => {
+                let art = match art_url {
+                    Some(u) => Self::art_url_of(&self.state, &mut self.url_art, &u, 232),
+                    None => Self::art_of(&self.state, &mut self.art, seed, 232),
+                };
+                self.ui.set_hero_art(art);
                 self.ui.set_hero_round(round);
                 self.ui.set_hero_kind(kind.into());
                 self.ui.set_hero_title(title.into());
@@ -509,8 +995,12 @@ impl Zuno {
                 self.ui.set_hero_counts(counts.into());
                 self.ui.set_hero_is_artist(false);
             }
-            Hero::Artist { seed, name, listeners, counts, top, album_specs } => {
-                self.ui.set_hero_art(Self::art_of(&self.state, &mut self.art, seed, 232));
+            Hero::Artist { seed, art_url, name, listeners, counts, top, album_specs } => {
+                let art = match art_url {
+                    Some(u) => Self::art_url_of(&self.state, &mut self.url_art, &u, 232),
+                    None => Self::art_of(&self.state, &mut self.art, seed, 232),
+                };
+                self.ui.set_hero_art(art);
                 self.ui.set_hero_round(true);
                 self.ui.set_hero_kind("Artist".into());
                 self.ui.set_hero_title(name.into());
@@ -572,13 +1062,15 @@ impl Zuno {
             .first()
             .map(|&id| {
                 let v = self.state.library.track_view(id);
+                let t = self.state.library.track(id);
                 let spec = CardSpec {
                     id,
                     kind: 3,
                     title: v.title.to_string(),
                     subtitle: format!("Song · {}", v.artist),
                     round: false,
-                    seed: AppState::album_seed(self.state.library.track(id).album_id),
+                    seed: AppState::album_seed(t.album_id),
+                    art_url: t.artwork_url.clone(),
                 };
                 self.filled_card(&spec, 176)
             })
@@ -620,6 +1112,7 @@ impl Zuno {
                 String::new()
             };
             last_region = Some(*region);
+            let art = self.track_art(*id, 32);
             let v = self.state.library.track_view(*id);
             let region_ix = match region {
                 Region::Played => 0,
@@ -634,10 +1127,7 @@ impl Zuno {
                 title: v.title.into(),
                 artist: v.artist.into(),
                 duration: mmss(v.duration_sec).into(),
-                art: self.art(
-                    AppState::album_seed(self.state.library.track(*id).album_id),
-                    32,
-                ),
+                art,
             });
         }
         self.queue.set_vec(rows);
@@ -671,22 +1161,27 @@ impl Zuno {
             self.last_current = self.state.current;
             match self.state.current_track() {
                 Some(track) => {
-                    let (title, artist_name, album_id, artist_id, liked) = (
+                    let (title, artist_name, album_id, artist_id, liked, art_url) = (
                         track.title.clone(),
                         self.state.library.artist(track.artist_id).name.clone(),
                         track.album_id,
                         track.artist_id,
                         track.liked,
+                        track.artwork_url.clone(),
                     );
                     self.ui.set_has_track(true);
                     self.ui.set_pb_title(title.into());
                     self.ui.set_pb_artist(artist_name.into());
-                    self.ui.set_pb_art(Self::art_of(
-                        &self.state,
-                        &mut self.art,
-                        AppState::album_seed(album_id),
-                        40,
-                    ));
+                    let pb_art = match art_url {
+                        Some(u) => Self::art_url_of(&self.state, &mut self.url_art, &u, 40),
+                        None => Self::art_of(
+                            &self.state,
+                            &mut self.art,
+                            AppState::album_seed(album_id),
+                            40,
+                        ),
+                    };
+                    self.ui.set_pb_art(pb_art);
                     self.ui.set_pb_album_id(album_id as i32);
                     self.ui.set_pb_artist_id(artist_id as i32);
                     self.ui.set_pb_liked(liked);
@@ -759,12 +1254,521 @@ impl Zuno {
             self.refresh_page();
         }
     }
+
+    // ——— real-YouTube playback (stream when live, synth otherwise) ———
+
+    fn video_of(&self, id: TrackId) -> String {
+        if (id as usize) < self.state.library.tracks.len() {
+            self.state.library.track(id).video_id.clone()
+        } else {
+            String::new()
+        }
+    }
+
+    /// Synth single-track start that leaves the queue cursor alone
+    /// (mirrors the private `AppState::start`).
+    fn start_synth(&mut self, id: TrackId) {
+        if (id as usize) >= self.state.library.tracks.len() {
+            return;
+        }
+        let track = self.state.library.track(id).clone();
+        self.state.player.play(&track, AppState::track_seed(id), 0.0);
+        self.state.current = Some(id);
+        self.state.playing = true;
+    }
+
+    /// User-initiated play of `ids[i]` — the queue becomes that list.
+    fn play_ids(&mut self, ids: &[TrackId], i: usize) {
+        if ids.is_empty() {
+            return;
+        }
+        let i = i.min(ids.len() - 1);
+        if self.is_bench() || !self.yt_live || self.video_of(ids[i]).is_empty() {
+            self.state.play_from(ids, i);
+            return;
+        }
+        self.state.queue.set_list(ids, i);
+        self.yt_source = ids.to_vec();
+        self.start_stream(ids[i]);
+    }
+
+    /// Start one track without touching the queue (advance / resume paths).
+    fn start_stream(&mut self, id: TrackId) {
+        if self.is_bench() || !self.yt_live || self.video_of(id).is_empty() {
+            self.start_synth(id);
+            return;
+        }
+        let vid = self.video_of(id);
+        self.state.current = Some(id);
+        self.state.playing = true;
+        spawn_stream(self.yt_tx.clone(), self.cookie(), id, vid);
+    }
+
+    /// Queue advance with the streaming start (mirrors `AppState::next`).
+    fn next_yt(&mut self) {
+        if let Some(id) = self.state.queue.next() {
+            self.start_stream(id);
+        } else if self.state.repeat == RepeatMode::All && !self.yt_source.is_empty() {
+            let src = self.yt_source.clone();
+            self.state.queue.set_list(&src, 0);
+            self.start_stream(src[0]);
+        } else {
+            self.state.playing = false;
+        }
+    }
+
+    fn prev_yt(&mut self) {
+        if self.state.player.position_sec() > 3.0 {
+            if let Some(id) = self.state.queue.prev() {
+                self.start_stream(id);
+                return;
+            }
+        }
+        if let Some(id) = self.state.current {
+            self.start_stream(id);
+        }
+    }
+
+    fn toggle_play_yt(&mut self) {
+        match self.state.current {
+            Some(_) if self.state.playing => {
+                self.state.player.pause();
+                self.state.playing = false;
+            }
+            Some(id) => {
+                let pos = self.state.player.position_sec();
+                if pos >= self.state.player.duration_sec() - 0.05 {
+                    self.start_stream(id); // restart after finishing
+                } else {
+                    self.state.player.resume();
+                    self.state.playing = true;
+                }
+            }
+            None => {
+                let ids = self.state.list_ids();
+                if !ids.is_empty() {
+                    self.play_ids(&ids, 0);
+                }
+            }
+        }
+    }
+
+    fn seek_yt(&mut self, sec: f64) {
+        if self.state.player.is_streaming() {
+            let dur = self.state.player.duration_sec();
+            self.state.player.seek_stream(sec.clamp(0.0, (dur - 0.2).max(0.0)));
+            self.state.playing = true;
+        } else {
+            self.state.seek(sec);
+        }
+    }
+
+    // ——— real-YouTube search (debounced, stale generations dropped) ———
+
+    fn schedule_search(&mut self) {
+        let q = self.state.search_query.trim().to_string();
+        self.ui.set_search_query(q.clone().into());
+        self.ui.set_search_has_query(!q.is_empty());
+        if q.is_empty() {
+            self.search_at = None;
+            self.search_gen += 1; // invalidate anything in flight
+            self.search_top.set_vec(Vec::new());
+            self.search_songs.set_vec(Vec::new());
+            self.search_albums.set_vec(Vec::new());
+            self.search_artists.set_vec(Vec::new());
+            self.page_ids = Vec::new();
+            return;
+        }
+        self.search_q = q;
+        self.search_at = Some(Instant::now());
+    }
+
+    fn poll_search(&mut self) {
+        if self.is_bench() || !self.yt_live {
+            return;
+        }
+        if let Some(at) = self.search_at {
+            if at.elapsed() >= Duration::from_millis(300) {
+                self.search_at = None;
+                self.search_gen += 1;
+                let gen = self.search_gen;
+                let q = self.search_q.clone();
+                spawn_search(self.yt_tx.clone(), self.cookie(), gen, q);
+            }
+        }
+    }
+
+    /// Search models straight from the results (relevance order), not via
+    /// the local scorer — the library already holds exactly these tracks.
+    fn refresh_search_yt(&mut self) {
+        let n = self.state.library.tracks.len() as u32;
+        let ids: Vec<TrackId> = (0..n).collect();
+        let top: Vec<CardData> = ids
+            .first()
+            .map(|&id| {
+                let v = self.state.library.track_view(id);
+                let t = self.state.library.track(id);
+                let spec = CardSpec {
+                    id,
+                    kind: 3,
+                    title: v.title.to_string(),
+                    subtitle: format!("Song · {}", v.artist),
+                    round: false,
+                    seed: AppState::album_seed(t.album_id),
+                    art_url: t.artwork_url.clone(),
+                };
+                self.filled_card(&spec, 176)
+            })
+            .into_iter()
+            .collect();
+        self.search_top.set_vec(top);
+        self.page_ids = ids.clone();
+        let rows: Vec<TrackRow> = ids.iter().map(|&id| self.track_row(id)).collect();
+        self.search_songs.set_vec(rows);
+        let album_specs: Vec<CardSpec> = (0..self.state.library.albums.len() as u32)
+            .map(|a| self.album_spec(a))
+            .collect();
+        let albums: Vec<CardData> =
+            album_specs.iter().map(|s| self.filled_card(s, 176)).collect();
+        self.search_albums.set_vec(albums);
+        let artist_specs: Vec<CardSpec> = (0..self.state.library.artists.len() as u32)
+            .map(|a| self.artist_spec(a))
+            .collect();
+        let artists: Vec<CardData> =
+            artist_specs.iter().map(|s| self.filled_card(s, 176)).collect();
+        self.search_artists.set_vec(artists);
+    }
+
+    // ——— real-YouTube navigation ———
+
+    /// Raw YT track behind a library track (parallel vec; `None` in synth).
+    fn yt_track(&self, id: TrackId) -> Option<YtTrack> {
+        self.yt_tracks.get(id as usize).cloned()
+    }
+
+    fn album_browse_of(&self, album_id: AlbumId) -> Option<String> {
+        let first = self.state.library.album(album_id).track_ids.first()?;
+        self.yt_track(*first)?.album?.browse_id.into()
+    }
+
+    fn artist_channel_of(&self, artist_id: ArtistId) -> Option<String> {
+        let name = self.state.library.artist(artist_id).name.clone();
+        self.yt_tracks
+            .iter()
+            .find(|t| t.artist_names() == name)?
+            .artists
+            .first()
+            .map(|a| a.channel_id.clone())
+    }
+
+    /// Local sub-library from an album's own tracks — the fallback when
+    /// YouTube gave no browse id for the group.
+    fn open_album_local(&mut self, album_id: AlbumId) {
+        let (title, tids) = {
+            let a = self.state.library.album(album_id);
+            (a.title.clone(), a.track_ids.clone())
+        };
+        let tracks: Vec<YtTrack> =
+            tids.iter().filter_map(|&t| self.yt_track(t)).collect();
+        if tracks.is_empty() {
+            self.state.open_album(album_id);
+            self.refresh_page();
+            return;
+        }
+        self.state.library = YtLibrary::from_tracks(&title, &tracks);
+        self.yt_tracks = tracks;
+        self.yt_pl_id = None;
+        let id = (0..self.state.library.albums.len() as u32)
+            .find(|&a| self.state.library.album(a).title == title)
+            .unwrap_or(0);
+        self.state.open_album(id);
+        self.build_static_models();
+        self.refresh_page();
+    }
+
+    fn open_album_yt(&mut self, album_id: AlbumId) {
+        match self.album_browse_of(album_id) {
+            Some(browse) => {
+                self.set_yt_status("Loading album…".to_string());
+                spawn_album(self.yt_tx.clone(), self.cookie(), browse);
+            }
+            None => self.open_album_local(album_id),
+        }
+    }
+
+    fn open_artist_yt(&mut self, artist_id: ArtistId) {
+        match self.artist_channel_of(artist_id) {
+            Some(channel) => {
+                self.set_yt_status("Loading artist…".to_string());
+                spawn_artist(self.yt_tx.clone(), self.cookie(), channel);
+            }
+            None => {
+                self.state.open_artist(artist_id);
+                self.refresh_page();
+            }
+        }
+    }
+
+    fn open_mix_yt(&mut self, ix: usize) {
+        let (id, title) = match (self.yt_mixes.get(ix), self.home_mixes.row_data(ix)) {
+            (Some(m), Some(card)) => (m.id.clone(), card.title.to_string()),
+            _ => return,
+        };
+        self.set_yt_status(format!("Loading playlist {title:?}…"));
+        spawn_playlist(self.yt_tx.clone(), self.cookie(), id, title);
+    }
+
+    /// Home library snapshot to restore when leaving search/detail views.
+    fn restore_home_lib(&mut self) {
+        if let Some((home, mixes)) = self.yt_home.clone() {
+            let tracks = home_tracks_of(&home);
+            self.state.library = YtLibrary::from_home(&home);
+            self.yt_tracks = tracks;
+            self.yt_mixes = mixes;
+            self.yt_pl_id = None;
+            self.build_static_models();
+        }
+    }
+
+    // ——— applying worker results (UI thread) ———
+
+    fn apply_art(&mut self, art: &ArtBatch) {
+        for (url, size, bytes) in art {
+            self.state.artwork.insert_bytes(url, *size, bytes);
+        }
+    }
+
+    fn apply_home_data(&mut self, home: YtHome, mixes: Vec<YtPlaylistHeader>, art: ArtBatch) {
+        self.apply_art(&art);
+        let tracks = home_tracks_of(&home);
+        let lib = YtLibrary::from_home(&home);
+        let n = lib.tracks.len();
+        eprintln!("[yt] home live: {n} tracks");
+        self.state.library = lib;
+        self.yt_tracks = tracks;
+        self.yt_mixes = mixes.clone();
+        self.yt_pl_id = None;
+        self.yt_home = Some((home, mixes));
+        self.yt_live = true;
+        self.yt_loading = false;
+        self.set_yt_status(format!("YouTube live — {n} tracks"));
+        self.ui.set_search_live(true);
+        self.build_static_models();
+        self.refresh_page();
+        // A query typed while loading now has a network to hit.
+        if matches!(self.state.view, View::Search) && !self.state.search_query.trim().is_empty() {
+            self.schedule_search();
+            // Run it now instead of waiting out the debounce.
+            self.search_at = Some(Instant::now() - Duration::from_millis(300));
+        }
+    }
+
+    fn apply_search_data(&mut self, gen: u64, results: YtSearchResults, art: ArtBatch) {
+        if gen != self.search_gen {
+            return; // stale
+        }
+        self.apply_art(&art);
+        let query = results.query.clone();
+        let lib = YtLibrary::from_search(&results);
+        eprintln!("[yt] search live: {} tracks for {query:?}", lib.tracks.len());
+        self.state.library = lib;
+        self.yt_tracks = results.tracks.clone();
+        self.yt_pl_id = None;
+        self.refresh_search_yt();
+        self.ui.set_search_query(query.into());
+        self.ui.set_search_has_query(true);
+    }
+
+    fn apply_album_data(&mut self, mut album: YtAlbum, art: ArtBatch) {
+        self.apply_art(&art);
+        // The adapter groups by track-level refs (no cover); the raw album
+        // thumbs are the better hero.
+        let hero = zuno_yt::pick_artwork(&album.thumbnails).map(str::to_string);
+        let mut lib = YtLibrary::from_album(&album);
+        if let Some(u) = hero {
+            for a in &mut lib.albums {
+                if a.artwork_url.is_none() {
+                    a.artwork_url = Some(u.clone());
+                }
+            }
+        }
+        let title = album.title.clone();
+        let n = lib.tracks.len();
+        self.state.library = lib;
+        self.yt_tracks = std::mem::take(&mut album.tracks);
+        self.yt_pl_id = None;
+        let id = (0..self.state.library.albums.len() as u32)
+            .find(|&a| self.state.library.album(a).title == title)
+            .unwrap_or(0);
+        self.state.open_album(id);
+        self.set_yt_status(format!("YouTube live — {title} ({n} tracks)"));
+        self.build_static_models();
+        self.refresh_page();
+    }
+
+    fn apply_artist_data(&mut self, mut artist: YtArtist, art: ArtBatch) {
+        self.apply_art(&art);
+        let hero = zuno_yt::pick_artwork(&artist.thumbnails).map(str::to_string);
+        let mut lib = YtLibrary::from_tracks(&artist.name, &artist.top_tracks);
+        if let Some(u) = hero {
+            for a in &mut lib.artists {
+                if a.artwork_url.is_none() {
+                    a.artwork_url = Some(u.clone());
+                }
+            }
+        }
+        let name = artist.name.clone();
+        self.state.library = lib;
+        self.yt_tracks = std::mem::take(&mut artist.top_tracks);
+        self.yt_pl_id = None;
+        // Note: the albums grid shows the top tracks' groups, not the
+        // artist's full discography refs (no second browse needed to play).
+        let id = (0..self.state.library.artists.len() as u32)
+            .find(|&a| self.state.library.artist(a).name == name)
+            .unwrap_or(0);
+        self.state.open_artist(id);
+        self.set_yt_status(format!("YouTube live — {name}"));
+        self.build_static_models();
+        self.refresh_page();
+    }
+
+    fn apply_playlist_data(&mut self, id: String, title: String, tracks: Vec<YtTrack>, art: ArtBatch) {
+        self.apply_art(&art);
+        let pl = YtPlaylist {
+            id: id.clone(),
+            title: title.clone(),
+            description: None,
+            thumbnails: Vec::new(),
+            tracks: tracks.clone(),
+        };
+        let mut lib = YtLibrary::from_playlist(&pl);
+        // Cover from the chart header when opened via the mixes shelf
+        // (the track-built library carries no playlist art of its own).
+        let cover = self
+            .yt_mixes
+            .iter()
+            .find(|m| m.id == id)
+            .and_then(|m| zuno_yt::pick_artwork(&m.thumbnails))
+            .map(str::to_string);
+        if let Some(u) = cover {
+            for p in &mut lib.playlists {
+                if p.artwork_url.is_none() {
+                    p.artwork_url = Some(u.clone());
+                }
+            }
+        }
+        let n = lib.tracks.len();
+        self.state.library = lib;
+        self.yt_tracks = tracks;
+        self.yt_pl_id = Some(id);
+        self.state.open_playlist(0);
+        self.set_yt_status(format!("YouTube live — {title} ({n} tracks)"));
+        self.build_static_models();
+        self.refresh_page();
+    }
+
+    fn apply_stream(&mut self, id: TrackId, url: String, mime: String) {
+        // Stale resolve (user moved on) — never hijack the new track.
+        if self.state.current != Some(id) {
+            return;
+        }
+        let cookie = self.cookie();
+        self.state.player.play_stream(&url, &mime, cookie.as_deref());
+        self.state.playing = true;
+    }
+
+    fn apply_stream_failed(&mut self, id: TrackId) {
+        if self.state.current != Some(id) {
+            return;
+        }
+        // Audible beats silent: synth fallback keeps the queue moving.
+        eprintln!("[yt] stream failed, synth fallback for track {id}");
+        self.start_synth(id);
+    }
+
+    fn apply_yt(&mut self, msg: YtMsg) {
+        if self.is_bench() {
+            return;
+        }
+        match msg {
+            YtMsg::Home { home, mixes, art } => self.apply_home_data(home, mixes, art),
+            YtMsg::HomeFailed(e) => {
+                self.yt_loading = false;
+                eprintln!("[yt] home failed: {e} (synthetic library kept)");
+                self.set_yt_status(format!("Offline ({e}) — built-in library"));
+            }
+            YtMsg::Search { gen, results, art } => self.apply_search_data(gen, results, art),
+            YtMsg::SearchFailed { gen, err } => {
+                if gen == self.search_gen {
+                    eprintln!("[yt] search failed: {err}");
+                    self.set_yt_status(format!("Search failed: {err}"));
+                }
+            }
+            YtMsg::DetailAlbum { album, art } => self.apply_album_data(album, art),
+            YtMsg::DetailArtist { artist, art } => self.apply_artist_data(artist, art),
+            YtMsg::DetailPlaylist { id, title, tracks, art } => {
+                self.apply_playlist_data(id, title, tracks, art)
+            }
+            YtMsg::DetailFailed(e) => {
+                eprintln!("[yt] detail failed: {e}");
+                self.set_yt_status(format!("Load failed: {e}"));
+            }
+            YtMsg::Stream { id, url, mime } => self.apply_stream(id, url, mime),
+            YtMsg::StreamFailed { id } => self.apply_stream_failed(id),
+            YtMsg::SignedIn { session, home, mixes, art } => {
+                if let Err(e) = session.save() {
+                    eprintln!("[yt] session persist failed: {e}");
+                }
+                self.session = Some(session);
+                self.apply_home_data(home, mixes, art);
+                let who = self
+                    .session
+                    .as_ref()
+                    .and_then(|s| s.account_identity())
+                    .map(|id| format!(" ({}…)", &id[..id.len().min(6)]))
+                    .unwrap_or_default();
+                let n = self.state.library.tracks.len();
+                self.set_yt_status(format!("Signed in{who} — {n} tracks"));
+            }
+            YtMsg::SignInFailed(e) => {
+                eprintln!("[yt] sign-in failed: {e}");
+                self.set_yt_status(format!("Sign-in failed: {e}"));
+            }
+        }
+    }
+
+    /// Fire-and-forget like → rating (local state stays the source of
+    /// truth; failures only log).
+    fn rate_yt(&mut self, id: TrackId, liked: bool) {
+        if self.is_bench() || !self.yt_live || self.session.is_none() {
+            return;
+        }
+        let vid = self.video_of(id);
+        if vid.is_empty() {
+            return;
+        }
+        let cookie = self.cookie();
+        let rating = if liked { Rating::Like } else { Rating::None };
+        thread::spawn(move || {
+            let r = yt_client(cookie.as_deref()).and_then(|mut yt| {
+                yt_rt()
+                    .block_on(yt.set_track_rating(&vid, rating))
+                    .map_err(|e| e.to_string())
+            });
+            if let Err(e) = r {
+                eprintln!("[yt] rating failed: {e}");
+            }
+        });
+    }
 }
 
 fn wire(ui: &ZunoWindow, zuno: &Rc<RefCell<Zuno>>) {
     let weak = zuno.clone();
     ui.on_nav_home(move || {
         let mut z = weak.borrow_mut();
+        if z.yt_live && !z.is_bench() {
+            z.restore_home_lib();
+        }
         z.state.go(View::Home);
         z.refresh_page();
     });
@@ -773,10 +1777,18 @@ fn wire(ui: &ZunoWindow, zuno: &Rc<RefCell<Zuno>>) {
         let mut z = weak.borrow_mut();
         z.state.go(View::Search);
         z.refresh_page();
+        // Re-entering with a query re-runs it live.
+        if z.yt_live && !z.is_bench() && !z.state.search_query.trim().is_empty() {
+            z.schedule_search();
+            z.search_at = Some(Instant::now() - Duration::from_millis(300));
+        }
     });
     let weak = zuno.clone();
     ui.on_nav_library(move || {
         let mut z = weak.borrow_mut();
+        if z.yt_live && !z.is_bench() {
+            z.restore_home_lib();
+        }
         z.state.go(View::Library);
         z.refresh_page();
     });
@@ -789,14 +1801,24 @@ fn wire(ui: &ZunoWindow, zuno: &Rc<RefCell<Zuno>>) {
     let weak = zuno.clone();
     ui.on_open_album(move |id| {
         let mut z = weak.borrow_mut();
-        z.state.open_album(id.max(0) as u32);
-        z.refresh_page();
+        let aid = id.max(0) as u32;
+        if z.yt_live && !z.is_bench() {
+            z.open_album_yt(aid);
+        } else {
+            z.state.open_album(aid);
+            z.refresh_page();
+        }
     });
     let weak = zuno.clone();
     ui.on_open_artist(move |id| {
         let mut z = weak.borrow_mut();
-        z.state.open_artist(id.max(0) as u32);
-        z.refresh_page();
+        let arid = id.max(0) as u32;
+        if z.yt_live && !z.is_bench() {
+            z.open_artist_yt(arid);
+        } else {
+            z.state.open_artist(arid);
+            z.refresh_page();
+        }
     });
     let weak = zuno.clone();
     ui.on_open_playlist(move |id| {
@@ -807,13 +1829,24 @@ fn wire(ui: &ZunoWindow, zuno: &Rc<RefCell<Zuno>>) {
     let weak = zuno.clone();
     ui.on_card_click(move |kind, id| {
         let mut z = weak.borrow_mut();
+        // Live mixes-shelf cards: id indexes the chart-playlist headers.
+        if z.yt_live && !z.is_bench() && kind == 2 {
+            z.open_mix_yt(id.max(0) as usize);
+            return;
+        }
         match kind {
+            0 if z.yt_live && !z.is_bench() => z.open_album_yt(id.max(0) as u32),
+            1 if z.yt_live && !z.is_bench() => z.open_artist_yt(id.max(0) as u32),
             0 => z.state.open_album(id.max(0) as u32),
             1 => z.state.open_artist(id.max(0) as u32),
             2 => z.state.open_playlist(id.max(0) as u32),
             _ => {
                 let tid = id.max(0) as u32;
-                z.state.play_track(tid);
+                if z.yt_live && !z.is_bench() {
+                    z.play_ids(&[tid], 0);
+                } else {
+                    z.state.play_track(tid);
+                }
             }
         }
         z.refresh_page();
@@ -834,7 +1867,11 @@ fn wire(ui: &ZunoWindow, zuno: &Rc<RefCell<Zuno>>) {
     ui.on_search_edited(move |t| {
         let mut z = weak.borrow_mut();
         z.state.set_search(&t);
-        z.refresh_search();
+        if z.yt_live && !z.is_bench() {
+            z.schedule_search();
+        } else {
+            z.refresh_search();
+        }
         z.refresh_page();
     });
     let weak = zuno.clone();
@@ -843,7 +1880,11 @@ fn wire(ui: &ZunoWindow, zuno: &Rc<RefCell<Zuno>>) {
         let ids = z.page_ids.clone();
         if !ids.is_empty() {
             let i = (ix.max(0) as usize).min(ids.len() - 1);
-            z.state.play_from(&ids, i);
+            if z.yt_live && !z.is_bench() {
+                z.play_ids(&ids, i);
+            } else {
+                z.state.play_from(&ids, i);
+            }
         }
     });
     let weak = zuno.clone();
@@ -851,7 +1892,11 @@ fn wire(ui: &ZunoWindow, zuno: &Rc<RefCell<Zuno>>) {
         let mut z = weak.borrow_mut();
         let ids = z.page_ids.clone();
         if !ids.is_empty() {
-            z.state.play_from(&ids, 0);
+            if z.yt_live && !z.is_bench() {
+                z.play_ids(&ids, 0);
+            } else {
+                z.state.play_from(&ids, 0);
+            }
             if !z.state.shuffle {
                 z.state.toggle_shuffle();
             }
@@ -862,7 +1907,11 @@ fn wire(ui: &ZunoWindow, zuno: &Rc<RefCell<Zuno>>) {
         let mut z = weak.borrow_mut();
         let ids = z.page_ids.clone();
         if !ids.is_empty() {
-            z.state.play_from(&ids, 0);
+            if z.yt_live && !z.is_bench() {
+                z.play_ids(&ids, 0);
+            } else {
+                z.state.play_from(&ids, 0);
+            }
         }
     });
     let weak = zuno.clone();
@@ -874,23 +1923,57 @@ fn wire(ui: &ZunoWindow, zuno: &Rc<RefCell<Zuno>>) {
         let tid = id as u32;
         z.state.toggle_like(tid);
         z.after_like(tid);
+        if z.yt_live && !z.is_bench() {
+            let liked = (tid as usize) < z.state.library.tracks.len()
+                && z.state.library.track(tid).liked;
+            z.rate_yt(tid, liked);
+        }
     });
     let weak = zuno.clone();
-    ui.on_toggle_play(move || weak.borrow_mut().state.toggle_play());
+    ui.on_toggle_play(move || {
+        let mut z = weak.borrow_mut();
+        if z.yt_live && !z.is_bench() {
+            z.toggle_play_yt();
+        } else {
+            z.state.toggle_play();
+        }
+    });
     let weak = zuno.clone();
-    ui.on_next_track(move || weak.borrow_mut().state.next());
+    ui.on_next_track(move || {
+        let mut z = weak.borrow_mut();
+        if z.yt_live && !z.is_bench() {
+            z.next_yt();
+        } else {
+            z.state.next();
+        }
+    });
     let weak = zuno.clone();
-    ui.on_prev_track(move || weak.borrow_mut().state.previous());
+    ui.on_prev_track(move || {
+        let mut z = weak.borrow_mut();
+        if z.yt_live && !z.is_bench() {
+            z.prev_yt();
+        } else {
+            z.state.previous();
+        }
+    });
     let weak = zuno.clone();
     ui.on_seek_to(move |f| {
         let mut z = weak.borrow_mut();
-        z.state.seek(f.max(0.0) as f64);
+        if z.yt_live && !z.is_bench() {
+            z.seek_yt(f.max(0.0) as f64);
+        } else {
+            z.state.seek(f.max(0.0) as f64);
+        }
     });
     let weak = zuno.clone();
     ui.on_seek_by(move |d| {
         let mut z = weak.borrow_mut();
         let pos = z.state.player.position_sec();
-        z.state.seek(pos + d as f64);
+        if z.yt_live && !z.is_bench() {
+            z.seek_yt(pos + d as f64);
+        } else {
+            z.state.seek(pos + d as f64);
+        }
     });
     let weak = zuno.clone();
     ui.on_set_volume(move |f| {
@@ -917,7 +2000,11 @@ fn wire(ui: &ZunoWindow, zuno: &Rc<RefCell<Zuno>>) {
     ui.on_queue_jump(move |ix| {
         let mut z = weak.borrow_mut();
         if let Some(id) = z.state.queue.jump_to(ix.max(0) as usize) {
-            z.state.play_track(id);
+            if z.yt_live && !z.is_bench() {
+                z.start_stream(id);
+            } else {
+                z.state.play_track(id);
+            }
         }
         z.refresh_queue();
     });
@@ -968,6 +2055,15 @@ fn wire(ui: &ZunoWindow, zuno: &Rc<RefCell<Zuno>>) {
     ui.on_card_art_home(make_art_cb(zuno, GridSlot::HomeNew));
     ui.on_card_art_library(make_art_cb(zuno, GridSlot::LibAlbums));
     ui.on_card_art_artist(make_art_cb(zuno, GridSlot::ArtistAlbums));
+    let weak = zuno.clone();
+    ui.on_sign_in(move |paste| {
+        let mut z = weak.borrow_mut();
+        if z.is_bench() {
+            return;
+        }
+        z.set_yt_status("Signing in…".to_string());
+        spawn_sign_in(z.yt_tx.clone(), paste.to_string());
+    });
 }
 
 fn make_art_cb(zuno: &Rc<RefCell<Zuno>>, slot: GridSlot) -> impl Fn(i32, i32) {
@@ -976,8 +2072,8 @@ fn make_art_cb(zuno: &Rc<RefCell<Zuno>>, slot: GridSlot) -> impl Fn(i32, i32) {
         let mut z = zuno.borrow_mut();
         let row = row.max(0) as usize;
         let col = col.max(0) as usize;
-        // Find the seed (and the row model) without holding a &mut borrow.
-        let seed = {
+        // Find the art source (and the row model) without holding a &mut borrow.
+        let (seed, art_url) = {
             let grid = z.grid(slot);
             let cols = grid.cols;
             let Some(rm) = grid.row_models.get(row).cloned() else { return };
@@ -986,9 +2082,12 @@ fn make_art_cb(zuno: &Rc<RefCell<Zuno>>, slot: GridSlot) -> impl Fn(i32, i32) {
                 return;
             }
             let Some(spec) = grid.specs.get(row * cols + col) else { return };
-            spec.seed
+            (spec.seed, spec.art_url.clone())
         };
-        let art = z.art(seed, 176);
+        let art = match art_url {
+            Some(u) => z.art_url(&u, 176),
+            None => z.art(seed, 176),
+        };
         let grid = z.grid(slot);
         if let Some(rm) = grid.row_models.get(row).cloned() {
             if let Some(card) = rm.row_data(col) {
@@ -1000,7 +2099,33 @@ fn make_art_cb(zuno: &Rc<RefCell<Zuno>>, slot: GridSlot) -> impl Fn(i32, i32) {
 
 fn tick(zuno: &Rc<RefCell<Zuno>>) {
     let mut z = zuno.borrow_mut();
-    z.state.tick();
+    // Background YouTube results (nothing ever spawns in `--bench`, so
+    // this only drains an empty channel there).
+    while let Ok(msg) = z.yt_rx.try_recv() {
+        z.apply_yt(msg);
+    }
+    z.poll_search();
+
+    // Track-end advance: streaming-aware when live (mirrors AppState::tick's
+    // repeat policy, but restarts streams instead of the synth).
+    let yt_ended = z.yt_live && !z.is_bench() && z.state.player.take_ended();
+    if yt_ended {
+        if z.state.repeat == RepeatMode::One {
+            if let Some(id) = z.state.current {
+                z.start_stream(id);
+            }
+        } else if let Some(id) = z.state.queue.next() {
+            z.start_stream(id);
+        } else if z.state.repeat == RepeatMode::All && !z.yt_source.is_empty() {
+            let src = z.yt_source.clone();
+            z.state.queue.set_list(&src, 0);
+            z.start_stream(src[0]);
+        } else {
+            z.state.playing = false;
+        }
+    } else {
+        z.state.tick();
+    }
 
     // Window width poll → responsive grid re-chunk + sidebar collapse.
     let w = z.ui.window().size().width as f32 / z.ui.window().scale_factor() as f32;
