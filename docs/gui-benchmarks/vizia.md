@@ -201,3 +201,39 @@ $ ldd target/release/zuno-vizia | grep -icE "webkit|gtk|cef|chromium|electron"
 test monitor: sidebar with playlist thumbs, "Home" h1, four shelves of
 album cards (hover scrim + red play pill implemented), popular-artists row,
 and the player bar with the red 40px play pill and seek/volume sliders.
+
+
+## Real-YouTube wiring
+
+Branch `gui/vizia` now loads real YouTube Music data through the shared
+`zuno-yt` crate (worker-thread + mpsc bridge: one std::thread owns a
+`YtClient` + single-threaded tokio runtime; the UI drains responses on its
+60 Hz tick). `--bench` spawns no worker — the synthetic benchmark path is
+untouched.
+
+**What loads live (unsigned, verified by screenshot on 2026-10-12):**
+home shelves swap from synthetic to real data seconds after first paint
+(5.4k distinct colors in the capture vs procedural's handful — real
+artwork covers decoded through `ArtworkCache::get_url`/`insert_bytes` in
+per-tick batches); search, album/artist/playlist drill-down, stream
+resolution, and cookie-paste sign-in are wired through the same worker
+(`YtReq::Search/Album/Artist/Playlist/Stream/SignIn`).
+
+**Playback:** stream resolution uses the same `zuno-yt` walk the iced and
+slint branches live-verified (iOS first, 21/21 resolves there); the
+googlevideo per-IP byte budget documented in `yt.md` gates sustained
+full-track audio the same way on every branch — first-chunk arrives, the
+rest 403s on a spent IP. Not a vizia wiring issue; the queue advances
+cleanly past it.
+
+**Bench comparability:** wired `--bench` peak 163.9 MB (phases flat:
+scroll/select/playback all 163.9, no leak) vs the pre-wiring 147.9–149.6 MB.
+The ~+14 MB is file-backed linked code — the binary grew to 47 MB with
+rquickjs + reqwest + tokio pages mapped — the same category as slint's
++6 MB delta, just larger because vizia's baseline was smaller. Startup
+sample: 152.2 MB (vs 149.7 pre-wiring).
+
+**Honest limits of this verification:** home+artwork visually confirmed;
+search/stream/sign-in are code-verified but not finger-tested (no
+automation route into a vizia window on this compositor — same wall the
+slint report documents; AT-SPI or a real user session would cover it).

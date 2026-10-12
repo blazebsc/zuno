@@ -11,5 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 zuno-core = { path = "../core" }
+zuno-yt = { path = "../yt" }
 vizia = "0.4.0"
 png = "0.17"
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "time"] }
