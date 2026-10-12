@@ -148,3 +148,38 @@ blake7  8622  3295  0 Oct06 ?  00:00:02 /usr/lib/webkitgtk-6.0/WebKitNetworkProc
 - Screenshot: `docs/gui-benchmarks/floem-home.png` (exact 1280×800 window,
   cropped from `grim`). Shelf rows intentionally overflow horizontally
   (scrollable shelves).
+
+
+## Real-YouTube wiring
+
+Branch `gui/floem` now loads real YouTube Music data through the shared
+`zuno-yt` crate: a dedicated worker thread owns the `YtClient` + a
+single-threaded tokio runtime (floem has no async executor), fed by a
+crossbeam request channel; the UI drains responses on its ~30 Hz frame
+pump. `--bench` creates no channels and spawns no worker — the synthetic
+benchmark path is untouched.
+
+**What loads live (unsigned, verified 2026-10-12):** the worker resolves
+home + a seed search, ships a `Library` through the channel, and the UI
+swaps it seconds after first paint — log shows `home ready: 35 tracks`,
+`home painted: 35 tracks`; the capture carries 8.4k distinct colors
+(real artwork through `ArtworkCache::get_url`/`insert_bytes`, pre-decoded
+at all five render sizes so the draw path never blocks). Search is
+debounced (350 ms coalescing on the worker, sequence-guarded on the UI),
+stream resolution rides the same worker (`Resolve` → `play_stream` with
+cookie), and Settings carries the cookie-paste sign-in (`SignIn` →
+`get_library` + session save; failure restores unsigned cleanly).
+
+**Playback:** same `zuno-yt` walk the iced/slint branches live-verified;
+the googlevideo per-IP byte budget documented in `yt.md` gates sustained
+audio identically here — synth fallback keeps the queue advancing.
+
+**Bench comparability (same-session):** wired startup 566.4 MB /
+scroll 494.7 MB / peak VmHWM 563.8 MB vs pre-wiring 563.9 / 485.1–485.3 /
+561.4–562.3 MB — ~+2.5 MB startup, ~+9 MB scroll, all phases flat (no
+leak); the same file-backed linked-code category every wired branch shows.
+
+**Honest limits:** home+artwork live-verified; search/stream/sign-in are
+code-verified via the same worker pattern the other branches proved, not
+finger-driven (no UI automation route on this compositor — same wall the
+slint/vizia reports document).
