@@ -9,6 +9,10 @@ path = "src/main.rs"
 
 [dependencies]
 zuno-core = { path = "../core" }
+zuno-yt = { path = "../yt" }
 gpui = "0.2"
 image = "0.25"
 unicode-segmentation = "1"
+# The yt worker thread runs a current-thread tokio runtime for the Innertube
+# POSTs (gpui's own executor is smol-based; reqwest async needs a reactor).
+tokio = { version = "1", default-features = false, features = ["rt"] }

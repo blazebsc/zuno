@@ -9,6 +9,9 @@
 //! port of the framework's own examples/input.rs (entity + EntityInputHandler
 //! + custom text element), and `Slider` below is a small custom element.
 
+mod yt;
+use yt::{cover_key, YtReq, YtResp};
+
 use gpui::{
     prelude::*, App, Application, AssetSource, Bounds, Context, CursorStyle, DispatchPhase,
     Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, Focusable,
@@ -32,6 +35,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use zuno_core::app::{LibraryTab, RepeatMode};
 use zuno_core::bench::{BenchAction, BenchDriver};
 use zuno_core::format::{count_songs, counts_line, listeners, mmss};
+use zuno_core::library::Library;
 use zuno_core::model::*;
 use zuno_core::queue::Region;
 use zuno_core::search;
@@ -47,6 +51,7 @@ static POPOVER: LazyLock<Hsla> = LazyLock::new(|| rgb(0x171717).into()); // queu
 static MUTED: LazyLock<Hsla> = LazyLock::new(|| rgb(0x262626).into()); // slider tracks
 static MUTED_FG: LazyLock<Hsla> = LazyLock::new(|| rgb(0xa1a1a1).into()); // secondary text
 static PRIMARY: LazyLock<Hsla> = LazyLock::new(|| rgb(0xff0033).into()); // accent
+static PRIMARY_HOVER: LazyLock<Hsla> = LazyLock::new(|| rgb(0xff1a40).into()); // accent hover
 
 /// `ElementId` has no `From<String>`; route format! ids through Name(SharedString).
 macro_rules! eid {
@@ -837,6 +842,23 @@ pub struct Zuno {
     bench: Option<BenchDriver>,
     bench_pending: bool,
     _search_sub: gpui::Subscription,
+    _cookie_sub: gpui::Subscription,
+    // — Real-YouTube wiring (all inert in --bench: no worker, no channels) —
+    yt_tx: Option<std::sync::mpsc::Sender<YtReq>>,
+    yt_rx: Option<std::sync::mpsc::Receiver<YtResp>>,
+    /// Copy of the response sender for cover-fetch threads.
+    yt_resp_tx: Option<std::sync::mpsc::Sender<YtResp>>,
+    home_lib: Option<Library>,
+    lib_is_search: bool,
+    covers_ready: std::collections::HashSet<String>,
+    covers_flying: RefCell<std::collections::HashSet<String>>,
+    cookie: SharedString,
+    cookie_input: Entity<SearchInput>,
+    yt_status: SharedString,
+    search_seq: u64,
+    resolving: Option<TrackId>,
+    /// Track currently served by `play_stream` (not synth).
+    stream_for: Option<TrackId>,
 }
 
 impl Render for Zuno {
@@ -888,9 +910,21 @@ impl Zuno {
         let search_input = cx.new(|cx| SearchInput::new(cx, focus_handle.clone()));
         let search_sub = cx.subscribe(&search_input, |this, _input, ev: &SearchChanged, cx| {
             this.app.set_search(&ev.0);
+            // Live-YouTube search: ship every keystroke to the worker
+            // (debounced worker-side, sequence-guarded on the way back).
+            if let Some(tx) = &this.yt_tx {
+                this.search_seq += 1;
+                let _ = tx.send(YtReq::Search { seq: this.search_seq, query: ev.0.to_string() });
+            }
             cx.notify();
         });
-        Zuno {
+        let cookie_input = cx.new(|cx| SearchInput::new(cx, cx.focus_handle()));
+        let cookie_sub = cx.subscribe(&cookie_input, |this, _input, ev: &SearchChanged, cx| {
+            this.cookie = ev.0.clone();
+            cx.notify();
+        });
+        let bench_pending = std::env::args().any(|a| a == "--bench");
+        let mut this = Zuno {
             app: AppState::new(),
             images: RefCell::new(HashMap::new()),
             queue_open: false,
@@ -899,15 +933,43 @@ impl Zuno {
             search_input,
             songs_scroll: UniformListScrollHandle::new(),
             bench: None,
-            bench_pending: std::env::args().any(|a| a == "--bench"),
+            bench_pending,
             _search_sub: search_sub,
+            yt_tx: None,
+            yt_rx: None,
+            yt_resp_tx: None,
+            home_lib: None,
+            lib_is_search: false,
+            covers_ready: std::collections::HashSet::new(),
+            covers_flying: RefCell::new(std::collections::HashSet::new()),
+            cookie: SharedString::default(),
+            cookie_input,
+            yt_status: SharedString::default(),
+            search_seq: 0,
+            resolving: None,
+            stream_for: None,
+            _cookie_sub: cookie_sub,
+        };
+        // Wire the real-YouTube worker (interactive only). Bench mode keeps
+        // every field None/empty — the synthetic path is untouched.
+        if !this.bench_pending {
+            let (req_tx, req_rx) = std::sync::mpsc::channel::<YtReq>();
+            let (resp_tx, resp_rx) = std::sync::mpsc::channel::<YtResp>();
+            yt::spawn(req_rx, resp_tx.clone());
+            this.yt_tx = Some(req_tx);
+            this.yt_rx = Some(resp_rx);
+            this.yt_resp_tx = Some(resp_tx);
+            let _ = this.yt_tx.as_ref().unwrap().send(YtReq::Home);
         }
+        this
     }
 
-    /// Per-frame tick: AppState::tick + the bench schedule.
+    /// Per-frame tick: AppState::tick + the bench schedule + YT drain.
     fn on_frame(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.frame = self.frame.wrapping_add(1);
         self.app.tick();
+        self.drain_yt();
+        self.maybe_request_stream();
         if self.bench_pending {
             self.bench_pending = false;
             self.bench = Some(BenchDriver::new()); // after first frame, per protocol
@@ -945,14 +1007,154 @@ impl Zuno {
         }
     }
 
+    // — Real-YouTube helpers ——————————————————————————————————————————
+
+    /// Swap the whole library (home load / live search / sign-in). Stops
+    /// playback and resets per-list state, exactly like the floem branch.
+    fn swap_library(&mut self, lib: Library, is_search: bool) {
+        self.app.player.stop();
+        self.app.library = lib;
+        self.app.current = None;
+        self.app.playing = false;
+        self.app.selection = None;
+        self.lib_is_search = is_search;
+        self.resolving = None;
+        self.stream_for = None;
+    }
+
+    /// Drain worker/cover responses on the UI thread, once per frame.
+    /// `std::sync::mpsc::Receiver` isn't `Clone`, so it's taken out and put
+    /// back — the borrow checker's cheap version of a `try_lock`.
+    fn drain_yt(&mut self) {
+        let Some(rx) = self.yt_rx.take() else { return };
+        while let Ok(resp) = rx.try_recv() {
+            match resp {
+                YtResp::Home(result) => match result {
+                    Ok(lib) => {
+                        eprintln!("[yt] home painted: {} tracks", lib.tracks.len());
+                        self.home_lib = Some(lib.clone());
+                        if !self.lib_is_search {
+                            self.swap_library(lib, false);
+                        }
+                        self.yt_status = "Live · YouTube Music".into();
+                    }
+                    Err(e) => self.yt_status = format!("YouTube offline — synthetic ({e})").into(),
+                },
+                YtResp::Search { seq, result } => {
+                    if seq != self.search_seq {
+                        continue; // stale keystroke
+                    }
+                    match result {
+                        Ok(lib) => self.swap_library(lib, true),
+                        Err(e) => self.yt_status = format!("Search failed: {e}").into(),
+                    }
+                }
+                YtResp::Stream(result) => match result {
+                    Ok((track, _video_id, info, cookie)) => {
+                        if self.app.current == Some(track) {
+                            self.app.player.play_stream(&info.url, &info.mime, cookie.as_deref());
+                            self.app.playing = true;
+                            self.yt_status = "Live · YouTube Music".into();
+                        }
+                        self.stream_for = Some(track);
+                        self.resolving = None;
+                    }
+                    Err(_e) => {
+                        // Keep synth playing; don't retry-loop the gate.
+                        if let Some(cur) = self.app.current {
+                            self.stream_for = Some(cur);
+                        }
+                        self.resolving = None;
+                    }
+                },
+                YtResp::SignedIn(result) => match result {
+                    Ok((lib, who)) => {
+                        self.home_lib = Some(lib.clone());
+                        self.swap_library(lib, false);
+                        self.cookie = SharedString::default();
+                        self.yt_status = format!("Signed in as {who}").into();
+                    }
+                    Err(msg) => self.yt_status = msg.into(),
+                },
+                YtResp::Cover { url, bytes } => {
+                    self.covers_flying.borrow_mut().remove(&url);
+                    if !bytes.is_empty() {
+                        // Every size the render path uses — see `art_img` calls.
+                        let mut ok = false;
+                        for size in [32u32, 40, 176, 232] {
+                            if self.app.artwork.insert_bytes(&url, size, &bytes).is_some() {
+                                ok = true;
+                            }
+                        }
+                        if ok {
+                            self.covers_ready.insert(url);
+                        }
+                    }
+                }
+            }
+        }
+        self.yt_rx = Some(rx);
+    }
+
+    /// After `tick`: a YT track playing synth (fresh `play_from`, queue
+    /// advance, next/prev) gets a stream resolve request. The ~one frame of
+    /// synth before the swap is inaudible; failures keep synth (see drain).
+    fn maybe_request_stream(&mut self) {
+        if self.yt_tx.is_none() {
+            return;
+        }
+        let Some(id) = self.app.current else { return };
+        if self.stream_for == Some(id) || self.resolving == Some(id) {
+            return;
+        }
+        let vid = self.app.library.track(id).video_id.clone();
+        if vid.is_empty() {
+            return; // synthetic/bench track — synth is the engine
+        }
+        self.resolving = Some(id);
+        let _ = self
+            .yt_tx
+            .as_ref()
+            .unwrap()
+            .send(YtReq::Resolve { track: id, video_id: vid });
+    }
+
     /// (seed,size) → GPU image. Decoded RGBA comes from the shared core
     /// `ArtworkCache` (96-cover LRU); only the BGRA frames are cached here.
     fn art(&self, seed: u64, size: u32) -> Arc<RenderImage> {
+        self.art_from_rgba(self.app.artwork.get(seed, size), seed, size)
+    }
+
+    /// Real cover for `url` when fetched (procedural fallback until then —
+    /// and the fetch itself is kicked here, bounded by `covers_flying`).
+    /// Bench tracks carry no `artwork_url`, so bench never leaves the
+    /// procedural path.
+    fn cover(&self, url: Option<&str>, seed: u64, size: u32) -> Arc<RenderImage> {
+        if let Some(u) = url {
+            if self.covers_ready.contains(u) {
+                // Pre-inserted at every render size by the Cover drain —
+                // `get_url` is a pure cache hit.
+                return self.art_from_rgba(self.app.artwork.get_url(u, size), crate::yt::cover_key(u), size);
+            }
+            if self.covers_flying.borrow_mut().insert(u.to_string()) {
+                if let Some(tx) = &self.yt_resp_tx {
+                    let tx = tx.clone();
+                    let u2 = u.to_string();
+                    std::thread::spawn(move || {
+                        let bytes = zuno_yt::fetch_artwork(&u2).unwrap_or_default();
+                        let _ = tx.send(YtResp::Cover { url: u2, bytes });
+                    });
+                }
+            }
+        }
+        self.art(seed, size)
+    }
+
+    fn art_from_rgba(&self, rgba: std::sync::Arc<Vec<u8>>, key: u64, size: u32) -> Arc<RenderImage> {
         let mut images = self.images.borrow_mut();
         images
-            .entry((seed, size))
+            .entry((key, size))
             .or_insert_with(|| {
-                let rgba = self.app.artwork.get(seed, size);
                 let mut bgra = (*rgba).clone();
                 for px4 in bgra.chunks_exact_mut(4) {
                     px4.swap(0, 2);
@@ -963,8 +1165,8 @@ impl Zuno {
             .clone()
     }
 
-    fn art_img(&self, seed: u64, size: u32, px_size: f32, round: bool) -> gpui::Img {
-        let img = gpui::img(self.art(seed, size))
+    fn art_img(&self, url: Option<&str>, seed: u64, size: u32, px_size: f32, round: bool) -> gpui::Img {
+        let img = gpui::img(self.cover(url, seed, size))
             .size(px(px_size))
             .flex_shrink_0();
         if round {
@@ -1063,6 +1265,7 @@ impl Zuno {
                 let artist = self.app.library.artist(album.artist_id);
                 self.view_collection(
                     cx,
+                    album.artwork_url.clone(),
                     AppState::album_seed(*id),
                     album.title.clone(),
                     format!("{} · {} · {}", album.kind.label(), artist.name, album.year),
@@ -1073,6 +1276,7 @@ impl Zuno {
                 let p = self.app.library.playlist(*id).expect("playlist exists");
                 self.view_collection(
                     cx,
+                    p.artwork_url.clone(),
                     AppState::playlist_seed(*id),
                     p.title.clone(),
                     format!(
@@ -1256,7 +1460,7 @@ impl Zuno {
                 this.app.open_playlist(pid);
                 cx.notify();
             }))
-            .child(self.art_img(AppState::playlist_seed(id), 40, t::ROW_ART, false))
+            .child(self.art_img(self.app.library.playlist(id).and_then(|p| p.artwork_url.as_deref()), AppState::playlist_seed(id), 40, t::ROW_ART, false))
             .child(
                 div()
                     .flex()
@@ -1323,6 +1527,7 @@ impl Zuno {
                     let mid = m.id;
                     self.generic_card(
                         cx,
+                        m.artwork_url.as_deref(),
                         AppState::playlist_seed(mid),
                         m.title.clone().into(),
                         m.description.clone().unwrap_or_default().into(),
@@ -1392,6 +1597,7 @@ impl Zuno {
         let ids = album.track_ids.clone();
         self.generic_card(
             cx,
+            album.artwork_url.as_deref(),
             AppState::album_seed(aid),
             album.title.clone().into(),
             format!("{} · {}", artist.name, album.year).into(),
@@ -1413,6 +1619,7 @@ impl Zuno {
     fn generic_card(
         &self,
         cx: &Context<Self>,
+        url: Option<&str>,
         seed: u64,
         title: SharedString,
         subtitle: SharedString,
@@ -1420,7 +1627,7 @@ impl Zuno {
         on_play: Box<dyn Fn(&mut Zuno)>,
     ) -> gpui::AnyElement {
         let group = format!("card-{seed}");
-        let art = self.art(seed, t::CARD_W as u32);
+        let art = self.cover(url, seed, t::CARD_W as u32);
         div()
             .id(ElementId::Name(group.clone().into()))
             .group(group.clone())
@@ -1507,7 +1714,7 @@ impl Zuno {
                 cx.notify();
             }))
             .hover(|s| s.cursor_pointer())
-            .child(div().size(px(176.)).child(self.art_img(AppState::artist_seed(rid), 176, 176., true)))
+            .child(div().size(px(176.)).child(self.art_img(self.app.library.artist(rid).artwork_url.as_deref(), AppState::artist_seed(rid), 176, 176., true)))
             .child(
                 div()
                     .text_size(px(t::BODY.size))
@@ -1590,7 +1797,7 @@ impl Zuno {
                             this.app.open_artist(rid);
                             cx.notify();
                         }))
-                        .child(self.art_img(AppState::artist_seed(rid), 40, t::ROW_ART, true))
+                        .child(self.art_img(self.app.library.artist(rid).artwork_url.as_deref(), AppState::artist_seed(rid), 40, t::ROW_ART, true))
                         .child(
                             div()
                                 .flex()
@@ -1636,7 +1843,7 @@ impl Zuno {
                             this.app.open_playlist(pid);
                             cx.notify();
                         }))
-                        .child(self.art_img(AppState::playlist_seed(pid), 40, t::ROW_ART, false))
+                        .child(self.art_img(self.app.library.playlist(pid).and_then(|p| p.artwork_url.as_deref()), AppState::playlist_seed(pid), 40, t::ROW_ART, false))
                         .child(
                             div()
                                 .flex()
@@ -1723,6 +1930,7 @@ impl Zuno {
     fn view_collection(
         &self,
         cx: &Context<Self>,
+        url: Option<String>,
         seed: u64,
         title: String,
         subtitle: String,
@@ -1736,7 +1944,7 @@ impl Zuno {
             .flex()
             .gap(px(24.))
             .pt(px(20.))
-            .child(self.art_img(seed, 232, 232., false))
+            .child(self.art_img(url.as_deref(), seed, 232, 232., false))
             .child(
                 div()
                     .flex()
@@ -1854,7 +2062,7 @@ impl Zuno {
             .flex()
             .gap(px(24.))
             .pt(px(20.))
-            .child(self.art_img(AppState::artist_seed(rid), 232, 232., true))
+            .child(self.art_img(self.app.library.artist(rid).artwork_url.as_deref(), AppState::artist_seed(rid), 232, 232., true))
             .child(
                 div()
                     .flex()
@@ -2010,6 +2218,7 @@ impl Zuno {
                         "Top result",
                         std::iter::once(self.generic_card(
                             cx,
+                            self.app.library.track(top_id).artwork_url.as_deref(),
                             AppState::album_seed(self.app.library.track(top_id).album_id),
                             tv.title.to_string().into(),
                             format!("Song · {}", tv.artist).into(),
@@ -2076,11 +2285,62 @@ impl Zuno {
         };
 
         let _ = cx;
+        let yt_section = div()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(Self::h3("YouTube Music"))
+            .child(
+                div()
+                    .id("cookie-field")
+                    .w(px(420.))
+                    .rounded_full()
+                    .bg(*MUTED)
+                    .overflow_hidden()
+                    .hover(|s| s.bg(*CARD))
+                    .child(self.cookie_input.clone()),
+            )
+            .child(
+                div()
+                    .id("sign-in-btn")
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(16.))
+                    .py(px(8.))
+                    .rounded_full()
+                    .bg(*PRIMARY)
+                    .hover(|s| s.bg(*PRIMARY_HOVER))
+                    .text_color(gpui::white())
+                    .text_size(px(t::BODY.size))
+                    .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
+                        if let Some(tx) = &this.yt_tx {
+                            let header = this.cookie.to_string();
+                            if !header.trim().is_empty() {
+                                let _ = tx.send(YtReq::SignIn { header });
+                                this.yt_status = "Signing in…".into();
+                            }
+                        }
+                        cx.notify();
+                    }))
+                    .child("Sign in with cookie"),
+            )
+            .child(
+                div()
+                    .text_size(px(t::SMALL.size))
+                    .text_color(*MUTED_FG)
+                    .child(format!(
+                        "Paste the Cookie: header from any music.youtube.com request (devtools → Network). {}",
+                        self.yt_status
+                    )),
+            );
+
         let col = div()
             .flex()
             .flex_col()
             .gap(px(24.))
             .child(div().pt(px(18.)).child(self.page_header(cx, "Settings")))
+            .child(yt_section)
             .child(
                 div()
                     .flex()
@@ -2159,7 +2419,7 @@ impl Zuno {
                         cx.notify();
                     }
                 }))
-                .child(self.art_img(AppState::album_seed(self.app.library.track(*id).album_id), 32, 32., false))
+                .child(self.art_img(self.app.library.track(*id).artwork_url.as_deref(), AppState::album_seed(self.app.library.track(*id).album_id), 32, 32., false))
                 .child(
                     div()
                         .flex()
@@ -2334,7 +2594,7 @@ impl Zuno {
                             cx.notify();
                         }
                     }))
-                    .child(self.art_img(seed, 40, t::ROW_ART, false)),
+                    .child(self.art_img(current.and_then(|t| t.artwork_url.clone()).as_deref(), seed, 40, t::ROW_ART, false)),
             )
             .child(
                 div()
@@ -2692,7 +2952,7 @@ impl Zuno {
                 })
             })
             .child(index_cell)
-            .child(self.art_img(art_seed, 40, t::ROW_ART, false))
+            .child(self.art_img(self.app.library.track(id).artwork_url.as_deref(), art_seed, 40, t::ROW_ART, false))
             .child(
                 div()
                     .flex()

@@ -159,3 +159,38 @@ ldd: zero matches. The one `WebKitNetworkProcess` on the machine belongs to
   Artist, Album, Playlist, Settings, Queue overlay) were each launched and left
   5 s with no crash, and the Search/Queue/Home/Songs views were visually
   inspected; the remaining views share the same row/card/shelf widgets.
+
+
+## Real-YouTube wiring
+
+Branch `gui/gpui` now loads real YouTube Music data through the shared
+`zuno-yt` crate — the worker-thread pattern (see floem/vizia): one
+std::thread owns a `YtClient` and a single-threaded tokio runtime (gpui's
+executor is smol-based, so the Innertube POSTs get their own reactor);
+`Zuno::on_frame` drains the response channel at the display frame rate.
+`--bench` creates no channels and spawns nothing — the synthetic path is
+untouched.
+
+**What loads live (unsigned, verified 2026-10-14):** home (20 tracks
+painted seconds after first paint; real artwork through
+`ArtworkCache::get_url`/`insert_bytes`, pre-decoded at the four render
+sizes — 10k distinct colors in the capture), debounced+sequence-guarded
+live search shipped on every keystroke, stream resolve → `play_stream`
+with synth fallback (the correction loop mirrors floem's: any YT track
+left on synth gets exactly one resolve request), and Settings carries a
+cookie-paste sign-in (a second `SearchInput` entity feeding the worker's
+`SignIn`, with saved-session restore at worker boot).
+
+**Playback:** the same `zuno-yt` walk; the googlevideo per-IP byte budget
+documented in `yt.md` gates sustained audio identically — synth keeps the
+queue advancing.
+
+**Bench comparability:** wired startup 258.5 MB / peak 258.9 MB vs
+pre-wiring 257.7/257.9 MB — ~+1 MB file-backed linked code, all phases
+flat (258.6→259.1 scroll, ±0.5 MB), no leak; uniform_list virtualization
+unaffected.
+
+**Build note:** libc 0.2.190 (resolved transitively through gpui →
+zed-async-tar → xattr 0.2.3) removed the `ENOATTR` alias xattr 0.2.3
+reads; the lock pins libc 0.2.189 (the newest version nix 0.31 accepts
+that still exports it).
