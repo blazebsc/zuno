@@ -9,5 +9,10 @@ path = "src/main.rs"
 
 [dependencies]
 zuno-core = { path = "../core" }
-freya = { version = "0.5.0-rc.9", features = ["icons-lucide", "titlebar", "borderless"] }
-freya-engine = "0.5.0-rc.9"
+zuno-yt = { path = "../yt" }
+# Async Innertube runtime only: freya tasks are single-threaded (no Send
+# bound), so the client lives in a tokio::sync::Mutex and the POSTs need a
+# running tokio reactor. Created exclusively in non-bench mode.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time", "sync"] }
+freya = { version = "=0.5.0-rc.9", features = ["icons-lucide", "titlebar", "borderless"] }
+freya-engine = "=0.5.0-rc.9"

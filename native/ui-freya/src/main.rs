@@ -1,8 +1,14 @@
 //! Zuno — freya implementation of the native-GUI benchmark (gui/freya branch).
 //!
-//! Freya 0.5.0-rc.9 (Dioxus + Skia). Renders the shared `zuno_core::AppState`
+//! Freya 0.5.0-rc.9. Renders the shared `zuno_core::AppState`
 //! per docs/gui-benchmarks/SPEC.md. The 5,000-track Library ▸ Songs list uses
 //! freya's lazy `VirtualScrollView`; everything else is plain elements.
+//!
+//! Real YouTube Music loads through `mod yt` (freya-native async tasks, no
+//! worker thread); `--bench` never initializes it — the synthetic benchmark
+//! path is untouched.
+
+mod yt;
 
 use freya::elements::image::ImageHandle;
 use freya::prelude::*;
@@ -53,22 +59,41 @@ fn imgs() -> &'static Mutex<HashMap<(u64, u32), ImageHandle>> {
     IMGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn art(app: &AppState, seed: u64, size: u32) -> Option<ImageHandle> {
-    let key = (seed, size);
+/// Artwork source: `Some(url)` = remote YouTube cover (procedural while the
+/// fetch is in flight), `None` = the benchmark's procedural seed. The
+/// `--bench` library carries no URLs, so its path is byte-identical.
+fn art(app: &AppState, url: Option<&str>, seed: u64, size: u32) -> Option<ImageHandle> {
+    let key = match url {
+        Some(u) if !u.is_empty() => (yt::url_hash(u), size),
+        _ => (seed, size),
+    };
     if let Some(h) = imgs().lock().unwrap().get(&key) {
         return Some(h.clone());
     }
-    let bytes = app.artwork.get(seed, size);
+    let bytes = match url {
+        Some(u) if !u.is_empty() && yt::cover_ready(u) => app.artwork.get_url(u, size),
+        _ => app.artwork.get(seed, size),
+    };
     let h = ImageHandle::from_rgba(size, size, Bytes::copy_from_slice(&bytes), AlphaType::Opaque)?;
     imgs().lock().unwrap().insert(key, h.clone());
     Some(h)
 }
 
+/// Drop the placeholder handles for a URL whose real bytes just landed, so
+/// the next frame uploads the fetched cover instead of the procedural one.
+pub(crate) fn imgs_purge_url(url: &str) {
+    let key = yt::url_hash(url);
+    let mut m = imgs().lock().unwrap();
+    for size in yt::COVER_SIZES {
+        m.remove(&(key, size));
+    }
+}
+
 /// Artwork tile with graceful fallback to a flat card-color tile.
-fn tile(app: State<AppState>, seed: u64, size: f32, radius: f32) -> Element {
+fn tile(app: State<AppState>, url: Option<&str>, seed: u64, size: f32, radius: f32) -> Element {
     let pa = app.peek();
     let px = size as u32;
-    match art(&pa, seed, px) {
+    match art(&pa, url, seed, px) {
         Some(h) => image(h)
             .width(Size::px(size))
             .height(Size::px(size))
@@ -153,11 +178,36 @@ struct Ui {
     frame: u64,
     sett_hq: bool,
     sett_norm: bool,
+    // — Real-YouTube wiring (all default/empty in --bench) —
+    yt_status: String,
+    /// Track a stream resolve is in flight for.
+    resolving: Option<TrackId>,
+    /// Track currently served by `play_stream` (or synth-fallback) — stops
+    /// the per-frame resolve loop from refiring.
+    stream_for: Option<TrackId>,
+    /// Whether the live library is search results (vs home).
+    lib_is_search: bool,
+    /// Sequence number for stale search arrivals.
+    search_rev: u64,
+    /// Last query fanned out to the debounced search.
+    search_sent: String,
 }
 
 impl Default for Ui {
     fn default() -> Self {
-        Self { queue_open: false, hover: None, frame: 0, sett_hq: true, sett_norm: false }
+        Self {
+            queue_open: false,
+            hover: None,
+            frame: 0,
+            sett_hq: true,
+            sett_norm: false,
+            yt_status: String::new(),
+            resolving: None,
+            stream_for: None,
+            lib_is_search: false,
+            search_rev: 0,
+            search_sent: String::new(),
+        }
     }
 }
 
@@ -181,6 +231,7 @@ struct Zuno {
     app: State<AppState>,
     ui: State<Ui>,
     search: State<String>,
+    cookie: State<String>,
 }
 
 fn main() {
@@ -196,13 +247,31 @@ fn main() {
     let app = State::create_global(state);
     let ui = State::create_global(Ui::default());
     let search = State::create_global(String::new());
+    let cookie = State::create_global(String::new());
+
+    // Real-YouTube mode (skipped entirely under --bench: no client, no
+    // threads, no runtime — the synthetic path stays as-is). The multi-thread
+    // runtime exists only to drive async reqwest sockets; freya tasks await
+    // the POSTs on the UI thread while its driver threads do the wakeups.
+    let mut yt_rt = None;
+    if !bench_on && yt::init() {
+        match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => yt_rt = Some(rt),
+            Err(e) => eprintln!("[yt] no async runtime: {e}"),
+        }
+    }
+    let _yt_enter = yt_rt.as_ref().map(|rt| rt.enter());
 
     launch(
         LaunchConfig::new()
             .with_font("Inter", Bytes::from_static(include_bytes!("../assets/Inter-Variable.ttf")))
             .with_default_font("Inter")
             .with_window(
-                WindowConfig::new_app(Zuno { app, ui, search })
+                WindowConfig::new_app(Zuno { app, ui, search, cookie })
                     .with_title("Zuno")
                     .with_size(1280.0, 800.0)
                     .with_min_size(900.0, 600.0)
@@ -221,7 +290,8 @@ impl App for Zuno {
         // (inside Freya context) — `ScrollController::new` panics in `main`.
         let songs = use_scroll_controller(ScrollConfig::default);
 
-        // Per-frame driver: audio auto-advance, search sync, bench schedule.
+        // Per-frame driver: audio auto-advance, search sync, bench schedule,
+        // plus the YouTube bridge tick (search fan-out, stream resolve).
         use_hook(|| {
             let app = self.app;
             let ui = self.ui;
@@ -274,11 +344,19 @@ impl App for Zuno {
                             }
                         }
                     }
+                    yt::frame_tick(&app, &ui, &search);
                     ui.write_unchecked().frame = frames;
                     platform.send(UserEvent::RequestRedraw);
                     ticker.tick().await;
                 }
             });
+            // First paint is the instant synthetic library; this swaps in the
+            // real catalog over the network a few seconds later.
+            if yt::enabled() {
+                let app = self.app;
+                let ui = self.ui;
+                spawn(yt::load_home(app.clone(), ui.clone()));
+            }
         });
 
         let app = self.app;
@@ -327,11 +405,11 @@ fn on_key(app: State<AppState>, ui: State<Ui>, e: Event<KeyboardEventData>) {
         }
         Key::Named(NamedKey::ArrowLeft) if !in_search => {
             let p = app.peek().player.position_sec();
-            app.write_unchecked().seek(p - 10.0);
+            yt::seek_to(&app, p - 10.0);
         }
         Key::Named(NamedKey::ArrowRight) if !in_search => {
             let p = app.peek().player.position_sec();
-            app.write_unchecked().seek(p + 10.0);
+            yt::seek_to(&app, p + 10.0);
         }
         Key::Named(NamedKey::ArrowUp) if !in_search => {
             step_selection(app, -1);
@@ -511,6 +589,7 @@ impl Zuno {
             let title = p.title.clone();
             let n = p.track_ids.len();
             let seed = AppState::playlist_seed(id);
+            let art_url = p.artwork_url.clone();
             let app = self.app;
             let ui = self.ui;
             let hid = format!("pl-{id}");
@@ -532,7 +611,7 @@ impl Zuno {
                     .on_press(move |_| {
                         app.write_unchecked().open_playlist(id);
                     })
-                    .child(tile(app, seed, 40.0, 4.0))
+                    .child(tile(app, art_url.as_deref(), seed, 40.0, 4.0))
                     .child(
                         rect()
                             .width(Size::flex(1.0))
@@ -550,6 +629,16 @@ impl Zuno {
             );
         }
         drop(g);
+        // Live-YouTube status (empty in --bench — nothing shows).
+        let status = self.ui.peek().yt_status.clone();
+        if !status.is_empty() {
+            list = list.child(
+                rect()
+                    .width(Size::fill())
+                    .padding(Gaps::new(16.0, 0.0, 0.0, 8.0))
+                    .child(small_muted(status)),
+            );
+        }
         rect()
             .width(Size::px(SIDEBAR_W))
             .height(Size::fill())
@@ -594,22 +683,22 @@ impl Zuno {
         let recent = g.library.home_recent_albums(12);
         let mixes: Vec<(u32, String)> =
             g.library.mixes.iter().map(|m| (m.id, m.title.clone())).collect();
-        let mut new_albums: Vec<(u32, String, String, u16)> = g
+        let mut new_albums: Vec<(u32, String, String, u16, Option<String>)> = g
             .library
             .albums
             .iter()
             .map(|a| {
                 let an = g.library.artist(a.artist_id).name.clone();
-                (a.id, a.title.clone(), an, a.year)
+                (a.id, a.title.clone(), an, a.year, a.artwork_url.clone())
             })
             .collect();
         new_albums.sort_by(|a, b| b.3.cmp(&a.3));
         new_albums.truncate(24);
-        let mut artists: Vec<(u32, String, u32)> = g
+        let mut artists: Vec<(u32, String, u32, Option<String>)> = g
             .library
             .artists
             .iter()
-            .map(|r| (r.id, r.name.clone(), r.monthly_listeners))
+            .map(|r| (r.id, r.name.clone(), r.monthly_listeners, r.artwork_url.clone()))
             .collect();
         artists.sort_by(|a, b| b.2.cmp(&a.2));
         artists.truncate(12);
@@ -644,8 +733,8 @@ impl Zuno {
         col = col.child(h2("New albums".to_string()));
         for chunk in new_albums.chunks(4) {
             let mut row = rect().width(Size::fill()).direction(Direction::Horizontal).spacing(16.0);
-            for (id, title, artist, year) in chunk {
-                row = row.child(self.album_card(*id, title.clone(), artist.clone(), *year));
+            for (id, title, artist, year, url) in chunk {
+                row = row.child(self.album_card(*id, title.clone(), artist.clone(), *year, url.clone()));
             }
             col = col.child(row);
         }
@@ -656,8 +745,8 @@ impl Zuno {
                 .direction(Direction::Horizontal)
                 .spacing(16.0)
                 .padding(Gaps::new_symmetric(4.0, 0.0));
-            for (id, name, _) in artists {
-                shelf = shelf.child(self.artist_card(id, name));
+            for (id, name, _, url) in artists {
+                shelf = shelf.child(self.artist_card(id, name, url));
             }
             col = col.child(
                 rect()
@@ -678,7 +767,8 @@ impl Zuno {
         for id in ids {
             if let Some(a) = g.library.albums.iter().find(|a| a.id == id) {
                 let an = g.library.artist(a.artist_id).name.clone();
-                shelf = shelf.child(self.album_card(a.id, a.title.clone(), an, a.year));
+                shelf =
+                    shelf.child(self.album_card(a.id, a.title.clone(), an, a.year, a.artwork_url.clone()));
             }
         }
         drop(g);
@@ -689,9 +779,10 @@ impl Zuno {
             .into()
     }
 
-    fn album_card(&self, id: u32, title: String, artist: String, year: u16) -> Element {
+    fn album_card(&self, id: u32, title: String, artist: String, year: u16, url: Option<String>) -> Element {
         self.card_base(
             format!("album-{id}"),
+            url,
             AppState::album_seed(id),
             title,
             format!("{artist} · {year}"),
@@ -703,9 +794,16 @@ impl Zuno {
     }
 
     fn mix_card(&self, id: u32, title: String) -> Element {
-        let n = self.app.peek().library.playlist(id).map(|p| p.track_ids.len()).unwrap_or(0);
+        let (n, url) = self
+            .app
+            .peek()
+            .library
+            .playlist(id)
+            .map(|p| (p.track_ids.len(), p.artwork_url.clone()))
+            .unwrap_or((0, None));
         self.card_base(
             format!("mix-{id}"),
+            url,
             AppState::playlist_seed(id),
             title,
             count_songs(n),
@@ -716,7 +814,7 @@ impl Zuno {
         )
     }
 
-    fn artist_card(&self, id: u32, name: String) -> Element {
+    fn artist_card(&self, id: u32, name: String, url: Option<String>) -> Element {
         let app = self.app;
         let ui = self.ui;
         let g = app.peek();
@@ -737,7 +835,7 @@ impl Zuno {
             .on_press(move |_| {
                 app.write_unchecked().open_artist(id);
             })
-            .child(tile(app, seed, CARD_W - 16.0, (CARD_W - 16.0) / 2.0))
+            .child(tile(app, url.as_deref(), seed, CARD_W - 16.0, (CARD_W - 16.0) / 2.0))
             .child(
                 label()
                     .text(name)
@@ -754,6 +852,7 @@ impl Zuno {
     fn card_base(
         &self,
         hid: String,
+        url: Option<String>,
         seed: u64,
         title: String,
         subtitle: String,
@@ -786,7 +885,7 @@ impl Zuno {
             .on_pointer_enter(move |_| set_hover(ui, &hid))
             .on_pointer_leave(move |_| clear_hover(ui, &hid2))
             .on_press(open)
-            .child(tile(app, seed, CARD_W - 16.0, 4.0))
+            .child(tile(app, url.as_deref(), seed, CARD_W - 16.0, 4.0))
             .child(
                 label().text(title).font_size(14.0).font_weight(500).color(fg()).max_lines(2),
             )
@@ -865,21 +964,21 @@ impl Zuno {
             }
             LibraryTab::Albums => {
                 let g = self.app.peek();
-                let albums: Vec<(u32, String, String, u16)> = g
+                let albums: Vec<(u32, String, String, u16, Option<String>)> = g
                     .library
                     .albums
                     .iter()
                     .map(|a| {
                         let an = g.library.artist(a.artist_id).name.clone();
-                        (a.id, a.title.clone(), an, a.year)
+                        (a.id, a.title.clone(), an, a.year, a.artwork_url.clone())
                     })
                     .collect();
                 drop(g);
                 let mut col = rect().width(Size::fill()).direction(Direction::Vertical).spacing(16.0);
                 for chunk in albums.chunks(4) {
                     let mut row = rect().width(Size::fill()).direction(Direction::Horizontal).spacing(16.0);
-                    for (id, title, artist, year) in chunk {
-                        row = row.child(self.album_card(*id, title.clone(), artist.clone(), *year));
+                    for (id, title, artist, year, url) in chunk {
+                        row = row.child(self.album_card(*id, title.clone(), artist.clone(), *year, url.clone()));
                     }
                     col = col.child(row);
                 }
@@ -893,16 +992,16 @@ impl Zuno {
             }
             LibraryTab::Artists => {
                 let g = self.app.peek();
-                let artists: Vec<(u32, String, u32, usize)> = g
+                let artists: Vec<(u32, String, u32, usize, Option<String>)> = g
                     .library
                     .artists
                     .iter()
-                    .map(|r| (r.id, r.name.clone(), r.monthly_listeners, r.album_ids.len()))
+                    .map(|r| (r.id, r.name.clone(), r.monthly_listeners, r.album_ids.len(), r.artwork_url.clone()))
                     .collect();
                 drop(g);
                 let mut col = rect().width(Size::fill()).direction(Direction::Vertical).spacing(2.0);
-                for (id, name, ml, nal) in artists {
-                    col = col.child(self.artist_row(id, name, ml, nal));
+                for (id, name, ml, nal, url) in artists {
+                    col = col.child(self.artist_row(id, name, ml, nal, url));
                 }
                 rect()
                     .width(Size::fill())
@@ -914,16 +1013,16 @@ impl Zuno {
             }
             LibraryTab::Playlists => {
                 let g = self.app.peek();
-                let pls: Vec<(u32, String, usize)> = g
+                let pls: Vec<(u32, String, usize, Option<String>)> = g
                     .library
                     .playlists
                     .iter()
-                    .map(|p| (p.id, p.title.clone(), p.track_ids.len()))
+                    .map(|p| (p.id, p.title.clone(), p.track_ids.len(), p.artwork_url.clone()))
                     .collect();
                 drop(g);
                 let mut col = rect().width(Size::fill()).direction(Direction::Vertical).spacing(2.0);
-                for (id, title, n) in pls {
-                    col = col.child(self.playlist_row(id, title, n));
+                for (id, title, n, url) in pls {
+                    col = col.child(self.playlist_row(id, title, n, url));
                 }
                 rect()
                     .width(Size::fill())
@@ -960,7 +1059,7 @@ impl Zuno {
             .into()
     }
 
-    fn artist_row(&self, id: u32, name: String, ml: u32, nal: usize) -> Element {
+    fn artist_row(&self, id: u32, name: String, ml: u32, nal: usize, url: Option<String>) -> Element {
         let app = self.app;
         let ui = self.ui;
         let hid = format!("lartist-{id}");
@@ -980,7 +1079,7 @@ impl Zuno {
             .on_press(move |_| {
                 app.write_unchecked().open_artist(id);
             })
-            .child(tile(app, AppState::artist_seed(id), 40.0, 20.0))
+            .child(tile(app, url.as_deref(), AppState::artist_seed(id), 40.0, 20.0))
             .child(
                 rect()
                     .width(Size::flex(1.0))
@@ -991,7 +1090,7 @@ impl Zuno {
             .into()
     }
 
-    fn playlist_row(&self, id: u32, title: String, n: usize) -> Element {
+    fn playlist_row(&self, id: u32, title: String, n: usize, url: Option<String>) -> Element {
         let app = self.app;
         let ui = self.ui;
         let hid = format!("lpl-{id}");
@@ -1011,7 +1110,7 @@ impl Zuno {
             .on_press(move |_| {
                 app.write_unchecked().open_playlist(id);
             })
-            .child(tile(app, AppState::playlist_seed(id), 40.0, 4.0))
+            .child(tile(app, url.as_deref(), AppState::playlist_seed(id), 40.0, 4.0))
             .child(
                 rect()
                     .width(Size::flex(1.0))
@@ -1066,6 +1165,7 @@ impl Zuno {
 
     fn detail_header(
         &self,
+        url: Option<String>,
         seed: u64,
         round: bool,
         title: String,
@@ -1077,7 +1177,7 @@ impl Zuno {
             .direction(Direction::Horizontal)
             .cross_align(Alignment::Center)
             .spacing(24.0)
-            .child(tile(self.app, seed, 232.0, if round { 116.0 } else { 4.0 }))
+            .child(tile(self.app, url.as_deref(), seed, 232.0, if round { 116.0 } else { 4.0 }))
             .child(
                 rect()
                     .width(Size::flex(1.0))
@@ -1104,17 +1204,18 @@ impl Zuno {
 
     fn album_page(&self, id: u32) -> Element {
         let g = self.app.peek();
-        let (title, artist, year, ids) = match g.library.albums.iter().find(|a| a.id == id) {
+        let (title, artist, year, url, ids) = match g.library.albums.iter().find(|a| a.id == id) {
             Some(a) => {
                 let an = g.library.artist(a.artist_id).name.clone();
-                (a.title.clone(), an, a.year, a.track_ids.clone())
+                (a.title.clone(), an, a.year, a.artwork_url.clone(), a.track_ids.clone())
             }
-            None => ("Unknown album".to_string(), String::new(), 0, Vec::new()),
+            None => ("Unknown album".to_string(), String::new(), 0, None, Vec::new()),
         };
         let durs: Vec<u32> = ids.iter().map(|t| g.library.track(*t).duration_sec).collect();
         let sub = counts_line(durs.iter().copied());
         drop(g);
         let header = self.detail_header(
+            url,
             AppState::album_seed(id),
             false,
             title,
@@ -1127,14 +1228,20 @@ impl Zuno {
 
     fn playlist_page(&self, id: u32) -> Element {
         let g = self.app.peek();
-        let (title, desc, ids) = match g.library.playlist(id) {
-            Some(p) => (p.title.clone(), p.description.clone().unwrap_or_default(), p.track_ids.clone()),
-            None => ("Unknown playlist".to_string(), String::new(), Vec::new()),
+        let (title, desc, url, ids) = match g.library.playlist(id) {
+            Some(p) => (
+                p.title.clone(),
+                p.description.clone().unwrap_or_default(),
+                p.artwork_url.clone(),
+                p.track_ids.clone(),
+            ),
+            None => ("Unknown playlist".to_string(), String::new(), None, Vec::new()),
         };
         let durs: Vec<u32> = ids.iter().map(|t| g.library.track(*t).duration_sec).collect();
         let sub = counts_line(durs.iter().copied());
         drop(g);
         let header = self.detail_header(
+            url,
             AppState::playlist_seed(id),
             false,
             title,
@@ -1147,7 +1254,7 @@ impl Zuno {
 
     fn artist_page(&self, id: u32) -> Element {
         let g = self.app.peek();
-        let (name, ml, top, album_ids) = match g.library.artists.iter().find(|r| r.id == id) {
+        let (name, ml, url, top, album_ids) = match g.library.artists.iter().find(|r| r.id == id) {
             Some(r) => {
                 let mut tids: Vec<TrackId> = Vec::new();
                 for aid in r.album_ids.iter().take(6) {
@@ -1158,9 +1265,9 @@ impl Zuno {
                         break;
                     }
                 }
-                (r.name.clone(), r.monthly_listeners, tids, r.album_ids.clone())
+                (r.name.clone(), r.monthly_listeners, r.artwork_url.clone(), tids, r.album_ids.clone())
             }
-            None => ("Unknown artist".to_string(), 0, Vec::new(), Vec::new()),
+            None => ("Unknown artist".to_string(), 0, None, Vec::new(), Vec::new()),
         };
         drop(g);
         let app = self.app;
@@ -1169,7 +1276,7 @@ impl Zuno {
             .direction(Direction::Horizontal)
             .cross_align(Alignment::Center)
             .spacing(24.0)
-            .child(tile(app, AppState::artist_seed(id), 232.0, 116.0))
+            .child(tile(app, url.as_deref(), AppState::artist_seed(id), 232.0, 116.0))
             .child(
                 rect()
                     .width(Size::flex(1.0))
@@ -1195,7 +1302,7 @@ impl Zuno {
             for aid in album_ids.iter() {
                 if let Some(a) = g2.library.albums.iter().find(|a| a.id == *aid) {
                     let an = g2.library.artist(a.artist_id).name.clone();
-                    row = row.child(self.album_card(a.id, a.title.clone(), an, a.year));
+                    row = row.child(self.album_card(a.id, a.title.clone(), an, a.year, a.artwork_url.clone()));
                     n += 1;
                     if n % 4 == 0 {
                         col = col.child(row);
@@ -1241,7 +1348,9 @@ impl Zuno {
         } else {
             if let Some(first) = res.tracks.first() {
                 let fview = g.library.track_view(*first);
-                let fseed = AppState::album_seed(g.library.track(*first).album_id);
+                let ft = g.library.track(*first);
+                let fseed = AppState::album_seed(ft.album_id);
+                let furl = ft.artwork_url.clone();
                 let top = rect()
                     .width(Size::fill())
                     .background(card())
@@ -1250,7 +1359,7 @@ impl Zuno {
                     .direction(Direction::Horizontal)
                     .cross_align(Alignment::Center)
                     .spacing(16.0)
-                    .child(tile(self.app, fseed, 96.0, 4.0))
+                    .child(tile(self.app, furl.as_deref(), fseed, 96.0, 4.0))
                     .child(
                         rect()
                             .direction(Direction::Vertical)
@@ -1275,7 +1384,7 @@ impl Zuno {
                 for aid in res.albums.iter().take(12) {
                     if let Some(a) = g.library.albums.iter().find(|a| a.id == *aid) {
                         let an = g.library.artist(a.artist_id).name.clone();
-                        shelf = shelf.child(self.album_card(a.id, a.title.clone(), an, a.year));
+                        shelf = shelf.child(self.album_card(a.id, a.title.clone(), an, a.year, a.artwork_url.clone()));
                     }
                 }
                 col = col.child(
@@ -1290,7 +1399,7 @@ impl Zuno {
                 let mut shelf = rect().direction(Direction::Horizontal).spacing(16.0);
                 for rid in res.artists.iter().take(12) {
                     if let Some(r) = g.library.artists.iter().find(|r| r.id == *rid) {
-                        shelf = shelf.child(self.artist_card(r.id, r.name.clone()));
+                        shelf = shelf.child(self.artist_card(r.id, r.name.clone(), r.artwork_url.clone()));
                     }
                 }
                 col = col.child(
@@ -1380,6 +1489,59 @@ impl Zuno {
                         .child(body("Quality".to_string()))
                         .child(small_muted("High · 320 kbps Opus (synth stand-in)".to_string())),
                 )
+                .child(h3("YouTube".to_string()))
+                .child({
+                    let app = self.app;
+                    let ui = self.ui;
+                    let cookie = self.cookie;
+                    let status = ui.peek().yt_status.clone();
+                    let enabled = yt::enabled();
+                    rect()
+                        .width(Size::fill())
+                        .background(card())
+                        .corner_radius(8.0)
+                        .padding(Gaps::new_all(16.0))
+                        .direction(Direction::Vertical)
+                        .spacing(8.0)
+                        .child(body("Sign in with cookie".to_string()))
+                        .child(small_muted(
+                            "Browser → music.youtube.com → devtools → Network → any /youtubei/ request → copy the Cookie: request header → paste → Sign in. Unsigned mode keeps all public content working."
+                                .to_string(),
+                        ))
+                        .child(
+                            rect()
+                                .width(Size::fill())
+                                .background(c(DARK.muted))
+                                .corner_radius(8.0)
+                                .padding(Gaps::new_symmetric(10.0, 12.0))
+                                .child(Input::new(cookie).placeholder("Paste the full Cookie: request header…")),
+                        )
+                        .child(
+                            rect()
+                                .direction(Direction::Horizontal)
+                                .cross_align(Alignment::Center)
+                                .spacing(12.0)
+                                .child(
+                                    rect()
+                                        .padding(Gaps::new_symmetric(10.0, 24.0))
+                                        .background(primary())
+                                        .corner_radius(999.0)
+                                        .on_press(move |_| {
+                                            if !yt::enabled() {
+                                                return;
+                                            }
+                                            let header = cookie.peek().trim().to_string();
+                                            if header.is_empty() {
+                                                return;
+                                            }
+                                            ui.write_unchecked().yt_status = "Signing in…".to_string();
+                                            spawn(yt::sign_in(app.clone(), ui.clone(), header));
+                                        })
+                                        .child(label().text(if enabled { "Sign in" } else { "Sign-in unavailable (bench mode)" }).font_size(14.0).font_weight(600).color((255, 255, 255))),
+                                )
+                                .child(small_muted(if status.is_empty() { "Unsigned · public content".to_string() } else { status })),
+                        )
+                })
                 .child(toggle("High quality audio", hq, |u| u.sett_hq = !u.sett_hq))
                 .child(toggle("Normalize volume", norm, |u| u.sett_norm = !u.sett_norm))
                 .into(),
@@ -1452,7 +1614,9 @@ impl Zuno {
             let title = tv.title.to_string();
             let artist = tv.artist.to_string();
             let dur = tv.duration_sec;
-            let seed = AppState::album_seed(g.library.track(*id).album_id);
+            let tq = g.library.track(*id);
+            let seed = AppState::album_seed(tq.album_id);
+            let art_url = tq.artwork_url.clone();
             col = col.child(
                 rect()
                     .width(Size::fill())
@@ -1470,7 +1634,7 @@ impl Zuno {
                             app.write_unchecked().play_track(pid);
                         }
                     })
-                    .child(tile(app, seed, 32.0, 4.0))
+                    .child(tile(app, art_url.as_deref(), seed, 32.0, 4.0))
                     .child(
                         rect()
                             .width(Size::flex(1.0))
@@ -1519,15 +1683,16 @@ impl Zuno {
         let app = self.app;
         let ui = self.ui;
         let g = app.peek();
-        let (title, artist, seed, liked, tid) = match g.current_track() {
+        let (title, artist, art_url, seed, liked, tid) = match g.current_track() {
             Some(t) => (
                 t.title.clone(),
                 g.library.artist(t.artist_id).name.clone(),
+                t.artwork_url.clone(),
                 AppState::album_seed(t.album_id),
                 t.liked,
                 Some(t.id),
             ),
-            None => ("Nothing playing".to_string(), "Zuno".to_string(), 0, false, None),
+            None => ("Nothing playing".to_string(), "Zuno".to_string(), None, 0, false, None),
         };
         let pos = g.player.position_sec();
         let dur = g.player.duration_sec();
@@ -1550,7 +1715,7 @@ impl Zuno {
             .cross_align(Alignment::Center)
             .padding(Gaps::new_symmetric(0.0, 16.0))
             .spacing(12.0)
-            .child(if tid.is_some() { tile(app, seed, 40.0, 4.0) } else {
+            .child(if tid.is_some() { tile(app, art_url.as_deref(), seed, 40.0, 4.0) } else {
                 rect().width(Size::px(40.0)).height(Size::px(40.0)).background(card()).corner_radius(4.0).into()
             })
             .child(
@@ -1612,7 +1777,7 @@ impl Zuno {
                     .child(Slider::new(move |v: f64| {
                         let d = app2.peek().player.duration_sec();
                         if d > 0.0 {
-                            app2.write_unchecked().seek(v / 100.0 * d);
+                            yt::seek_to(&app2, v / 100.0 * d);
                         }
                     }).value(seek_val))
             })
@@ -1710,7 +1875,9 @@ fn track_row(app: State<AppState>, ui: State<Ui>, g: &AppState, id: TrackId, ind
     let dur = tv.duration_sec;
     let explicit = tv.explicit;
     let liked = tv.liked;
-    let seed = AppState::album_seed(g.library.track(id).album_id);
+    let t = g.library.track(id);
+    let seed = AppState::album_seed(t.album_id);
+    let art_url = t.artwork_url.clone();
     let is_current = g.current == Some(id);
     let playing = is_current && g.playing;
     let selected = g.selection == Some(index);
@@ -1755,7 +1922,7 @@ fn track_row(app: State<AppState>, ui: State<Ui>, g: &AppState, id: TrackId, ind
                 .width(Size::px(24.0))
                 .into()
         })
-        .child(tile(app, seed, 40.0, 4.0))
+        .child(tile(app, art_url.as_deref(), seed, 40.0, 4.0))
         .child(
             rect()
                 .width(Size::flex(1.0))

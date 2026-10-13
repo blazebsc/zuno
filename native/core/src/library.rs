@@ -12,6 +12,9 @@ use crate::rng::Rng;
 /// Number of tracks the benchmark generates (the spec's minimum).
 pub const BENCH_TRACKS: usize = 5_000;
 
+/// library so it can restore Home after a search — every field is a `Vec`
+/// of `Clone` models, so the derive costs nothing but that affordance.
+#[derive(Clone)]
 pub struct Library {
     pub tracks: Vec<Track>,
     pub albums: Vec<Album>,

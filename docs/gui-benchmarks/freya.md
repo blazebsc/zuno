@@ -188,3 +188,38 @@ $ ps -o pid,etime,rss,nlwp,pcpu,comm -p 4036789  # run 3, ~22 s in
 - `freya` is an RC: `cargo build` is clean with zero warnings, but expect API
   churn before 0.5 stable (`use_scroll_controller`'s closure config,
   `GenerationalRef` read/write split, theme-preference plumbing).
+
+
+## Real-YouTube wiring
+
+Branch `gui/freya` now loads real YouTube Music data through the shared
+`zuno-yt` crate — freya-native async, no worker thread: `main` builds a
+2-worker tokio runtime (entered for the whole run; driver threads do the
+socket wakeups) and freya tasks await the Innertube POSTs directly.
+`--bench` skips `yt::init()` entirely — no client, no runtime, no
+threads; the synthetic path is untouched.
+
+**What loads live (unsigned, verified 2026-10-13):** home (5 shelves,
+20 tracks painted; real artwork through `ArtworkCache::get_url`,
+pre-decoded at all five render sizes — 5.8k distinct colors in the
+capture), debounced+revision-guarded live search (`timer()` debounce on
+freya's async-io), stream resolve → `play_stream` with synth fallback,
+cookie-paste sign-in with saved-session restore (the 60-second devtools
+recipe is in `yt.md`). The client sits in a `tokio::sync::Mutex` so
+requests serialize without deadlocking the UI-thread executor.
+
+**Playback:** same `zuno-yt` walk; the googlevideo per-IP byte budget
+documented in `yt.md` gates sustained audio identically (synth fallback
+keeps the queue advancing).
+
+**Bench comparability:** wired startup 166.0 MB (vs 162.6 pre-wiring =
++3.4 MB file-backed linked code), peak VmHWM 200.2 MB vs the pre-wiring
+runs' 207.1/170.0/165.9 spread — within the variance band the original
+report documents (niri occlusion throttling; playback-phase samples
+dropping to 103.9 min show pages being returned mid-phase). All
+non-playback phases flat (scroll 198.0 ±0.4, select 201.1 — no leak).
+
+**One fix over the interrupted draft:** `yt::init()` initialized only the
+client lock, leaving `HOME_LIB`/`COVERS_*` OnceLocks unset — the home
+load panicked on first `HOME_LIB.get().unwrap()`. All locks now seed in
+`init()`.
