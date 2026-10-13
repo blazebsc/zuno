@@ -139,3 +139,33 @@ blake7 8622 3295 0 Oct06 ? 00:00:02 /usr/lib/webkitgtk-6.0/WebKitNetworkProcess 
   (startup sample 811 MB, list built before the sample); redone to park on
   first `ScrollTo` like iced so the phases are comparable. Only the two runs
   above (final binary, final methodology) are reported.
+
+
+## Real-YouTube wiring
+
+Branch `gui/xilem` now loads real YouTube Music data through the shared
+`zuno-yt` crate — the worker-thread pattern: one std::thread owns a
+`YtClient` and a single-threaded tokio runtime (Masonry has no async), a
+crossbeam request/response pair bridges to the UI, and the 16 ms tick task
+drains responses. `--bench` creates no channels — the synthetic path is
+untouched. (crossbeam rather than std mpsc: xilem's view types inherit the
+state's auto traits, and std's `Receiver` is `!Sync`, which poisoned every
+view signature — recorded here for the next evaluator.)
+
+**What loads live (unsigned, verified 2026-10-14):** home (20 tracks
+painted seconds after first paint; real artwork through
+`ArtworkCache::get_url`/`insert_bytes`, pre-decoded at the four render
+sizes — 13k distinct colors in the capture), live search shipped on
+every keystroke with worker-side debounce + sequence guards, stream
+resolve → `play_stream` with synth fallback, cookie-paste sign-in in
+Settings (xilem's `text_input` + the `hot` clickable), saved-session
+restore at worker boot.
+
+**Playback:** the same `zuno-yt` walk; the googlevideo per-IP byte
+budget documented in `yt.md` gates sustained audio identically.
+
+**Bench comparability:** wired startup 452.4 MB / scroll 1055.3 MB /
+peak 1122.8 MB vs pre-wiring 450 / 1052 / 1118.5–1121.9 MB — ~+3 MB
+file-backed linked code, all phases flat (no leak); Masonry still has no
+virtualization, all 5,000 rows resident — the honest 2×-iced cost
+recorded in the original report stands.

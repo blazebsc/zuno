@@ -18,6 +18,7 @@
 //! `WindowControl`), vector `Glyph`s, and `Scrolled`.
 
 mod widgets;
+mod yt;
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -47,7 +48,9 @@ use zuno_core::queue::Region;
 use zuno_core::search;
 use zuno_core::theme as t;
 use zuno_core::app::{LibraryTab, RepeatMode};
+use zuno_core::library::Library;
 use zuno_core::{AppState, View as AppView};
+use yt::{YtReq, YtResp};
 
 
 use crate::widgets::{
@@ -110,6 +113,19 @@ struct Zuno {
     /// Settings-page demo toggles (rendered, not wired).
     settings_autostart: bool,
     settings_explicit: bool,
+    // — Real-YouTube wiring (all inert in --bench: no worker, no channels) —
+    yt_tx: Option<crossbeam_channel::Sender<YtReq>>,
+    yt_rx: Option<crossbeam_channel::Receiver<YtResp>>,
+    yt_resp_tx: Option<crossbeam_channel::Sender<YtResp>>,
+    home_lib: Option<Library>,
+    lib_is_search: bool,
+    covers_ready: std::collections::HashSet<String>,
+    covers_flying: std::collections::HashSet<String>,
+    cookie: String,
+    yt_status: String,
+    search_seq: u64,
+    resolving: Option<TrackId>,
+    stream_for: Option<TrackId>,
 }
 
 impl Zuno {
@@ -127,6 +143,46 @@ impl Zuno {
             height: size,
         });
         self.art.insert((seed, size, round), brush.clone());
+        brush
+    }
+
+    /// Real cover when fetched, procedural until then (the fetch is kicked
+    /// here). Bench tracks carry no `artwork_url` — bench never leaves the
+    /// procedural path. URL keys flip the top bit — no collision with seeds.
+    fn cover(&mut self, url: Option<&str>, seed: u64, size: u32, round: bool) -> ImageBrush {
+        if let Some(u) = url {
+            if self.covers_ready.contains(u) {
+                let key = yt::cover_key(u);
+                if let Some(b) = self.art.get(&(key, size, round)) {
+                    return b.clone();
+                }
+                let rgba = self.app.artwork.get_url(u, size);
+                return self.brush_from(rgba, key, size, round);
+            }
+            if self.covers_flying.insert(u.to_string()) {
+                if let Some(tx) = &self.yt_resp_tx {
+                    let tx = tx.clone();
+                    let u2 = u.to_string();
+                    std::thread::spawn(move || {
+                        let bytes = zuno_yt::fetch_artwork(&u2).unwrap_or_default();
+                        let _ = tx.send(YtResp::Cover { url: u2, bytes });
+                    });
+                }
+            }
+        }
+        self.art(seed, size, round)
+    }
+
+    fn brush_from(&mut self, rgba: std::sync::Arc<Vec<u8>>, key: u64, size: u32, round: bool) -> ImageBrush {
+        let data: Vec<u8> = if round { mask_circle(&rgba, size) } else { rgba.to_vec() };
+        let brush = ImageBrush::new(ImageData {
+            data: Blob::from(data),
+            format: ImageFormat::Rgba8,
+            alpha_type: ImageAlphaType::Alpha,
+            width: size,
+            height: size,
+        });
+        self.art.insert((key, size, round), brush.clone());
         brush
     }
 }
@@ -159,11 +215,118 @@ impl xilem::AppState for Zuno {
     }
 }
 
+impl Zuno {
+    /// Swap the whole library (home / live search / sign-in), resetting
+    /// per-list state — same contract as the other wired branches.
+    fn swap_library(&mut self, lib: Library, is_search: bool) {
+        self.app.player.stop();
+        self.app.library = lib;
+        self.app.current = None;
+        self.app.playing = false;
+        self.app.selection = None;
+        self.lib_is_search = is_search;
+        self.resolving = None;
+        self.stream_for = None;
+    }
+
+    /// Drain worker/cover responses on the UI thread, once per tick.
+    fn drain_yt(&mut self) {
+        let Some(rx) = self.yt_rx.take() else { return };
+        while let Ok(resp) = rx.try_recv() {
+            match resp {
+                YtResp::Home(result) => match result {
+                    Ok(lib) => {
+                        eprintln!("[yt] home painted: {} tracks", lib.tracks.len());
+                        self.home_lib = Some(lib.clone());
+                        if !self.lib_is_search {
+                            self.swap_library(lib, false);
+                        }
+                        self.yt_status = "Live · YouTube Music".to_string();
+                    }
+                    Err(e) => self.yt_status = format!("YouTube offline — synthetic ({e})"),
+                },
+                YtResp::Search { seq, result } => {
+                    if seq != self.search_seq {
+                        continue; // stale keystroke
+                    }
+                    match result {
+                        Ok(lib) => self.swap_library(lib, true),
+                        Err(e) => self.yt_status = format!("Search failed: {e}"),
+                    }
+                }
+                YtResp::Stream(result) => match result {
+                    Ok((track, _vid, info, cookie)) => {
+                        if self.app.current == Some(track) {
+                            self.app.player.play_stream(&info.url, &info.mime, cookie.as_deref());
+                            self.app.playing = true;
+                            self.yt_status = "Live · YouTube Music".to_string();
+                        }
+                        self.stream_for = Some(track);
+                        self.resolving = None;
+                    }
+                    Err(_e) => {
+                        if let Some(cur) = self.app.current {
+                            self.stream_for = Some(cur); // keep synth; don't retry-loop
+                        }
+                        self.resolving = None;
+                    }
+                },
+                YtResp::SignedIn(result) => match result {
+                    Ok((lib, who)) => {
+                        self.home_lib = Some(lib.clone());
+                        self.swap_library(lib, false);
+                        self.cookie.clear();
+                        self.yt_status = format!("Signed in as {who}");
+                    }
+                    Err(msg) => self.yt_status = msg,
+                },
+                YtResp::Cover { url, bytes } => {
+                    self.covers_flying.remove(&url);
+                    if !bytes.is_empty() {
+                        // Every size the render path uses (see cover() calls).
+                        let mut ok = false;
+                        for size in [40u32, 120, 176, 232] {
+                            if self.app.artwork.insert_bytes(&url, size, &bytes).is_some() {
+                                ok = true;
+                            }
+                        }
+                        if ok {
+                            self.covers_ready.insert(url);
+                        }
+                    }
+                }
+            }
+        }
+        self.yt_rx = Some(rx);
+    }
+
+    /// After `tick`: a YT track left on synth gets exactly one resolve.
+    fn maybe_request_stream(&mut self) {
+        if self.yt_tx.is_none() {
+            return;
+        }
+        let Some(id) = self.app.current else { return };
+        if self.stream_for == Some(id) || self.resolving == Some(id) {
+            return;
+        }
+        let vid = self.app.library.track(id).video_id.clone();
+        if vid.is_empty() {
+            return;
+        }
+        self.resolving = Some(id);
+        let _ = self
+            .yt_tx
+            .as_ref()
+            .unwrap()
+            .send(YtReq::Resolve { track: id, video_id: vid });
+    }
+}
+
 // — main / window —————————————————————————————————————————————————————————
 
 fn main() -> Result<(), EventLoopError> {
     let bench = std::env::args().any(|a| a == "--bench");
-    let zuno = Zuno {
+    let mut zuno = Zuno {
         app: AppState::new(),
         art: HashMap::new(),
         queue_open: false,
@@ -177,7 +340,29 @@ fn main() -> Result<(), EventLoopError> {
         window_id: WindowId::next(),
         settings_autostart: false,
         settings_explicit: true,
+        yt_tx: None,
+        yt_rx: None,
+        yt_resp_tx: None,
+        home_lib: None,
+        lib_is_search: false,
+        covers_ready: std::collections::HashSet::new(),
+        covers_flying: std::collections::HashSet::new(),
+        cookie: String::new(),
+        yt_status: String::new(),
+        search_seq: 0,
+        resolving: None,
+        stream_for: None,
     };
+    // Wire the real-YouTube worker (interactive only; bench stays synthetic).
+    if !bench {
+        let (req_tx, req_rx) = crossbeam_channel::unbounded::<YtReq>();
+        let (resp_tx, resp_rx) = crossbeam_channel::unbounded::<YtResp>();
+        yt::spawn(req_rx, resp_tx.clone());
+        zuno.yt_tx = Some(req_tx);
+        zuno.yt_rx = Some(resp_rx);
+        zuno.yt_resp_tx = Some(resp_tx);
+        let _ = zuno.yt_tx.as_ref().unwrap().send(YtReq::Home);
+    }
     Xilem::new(zuno, app_logic)
         .with_font(Blob::from(include_bytes!("../assets/Inter-Variable.ttf").to_vec()))
         .run_in(EventLoop::with_user_event())?;
@@ -255,6 +440,8 @@ fn tick_task() -> impl View<Zuno, (), ViewCtx, Element = xilem::core::NoElement>
             z.frame += 1;
             z.ticks += 1;
             z.app.tick();
+            z.drain_yt();
+            z.maybe_request_stream();
             // Construct the bench driver ~0.5 s after the first frame so
             // vello's first-frame shader warmup isn't billed to the schedule.
             if z.bench_pending && z.ticks >= 30 {
@@ -457,6 +644,15 @@ fn content_header(z: &mut Zuno) -> impl WidgetView<Zuno> + use<> {
     let query = z.app.search_query.clone();
     let search_field = text_input(query, |z: &mut Zuno, q: String| {
         z.app.set_search(&q);
+        if let Some(tx) = &z.yt_tx {
+            z.search_seq += 1;
+            let _ = tx.send(YtReq::Search { seq: z.search_seq, query: q.clone() });
+            if q.trim().is_empty() && z.lib_is_search {
+                if let Some(home) = z.home_lib.clone() {
+                    z.swap_library(home, false);
+                }
+            }
+        }
     })
     .placeholder("What do you want to listen to?")
     .text_color(FG)
@@ -522,7 +718,8 @@ fn playlist_row(z: &mut Zuno, id: PlaylistId) -> AnyV {
     let count = p.track_ids.len();
     let seed = AppState::playlist_seed(id);
     let active = matches!(&z.app.view, AppView::Playlist(v) if *v == id);
-    let art = z.art(seed, t::ROW_ART as u32, false);
+    let art_url = p.artwork_url.clone();
+    let art = z.cover(art_url.as_deref(), seed, t::ROW_ART as u32, false);
     hot(
         flex_row((
             xilem::view::sized_box(image(art).fit(ObjectFit::Fill))
@@ -640,7 +837,8 @@ fn album_card(z: &mut Zuno, id: AlbumId) -> AnyV {
     let title = a.title.clone();
     let artist = z.app.library.artist(a.artist_id).name.clone();
     let year = a.year;
-    let art = z.art(AppState::album_seed(id), t::CARD_W as u32, false);
+    let art_url = a.artwork_url.clone();
+    let art = z.cover(art_url.as_deref(), AppState::album_seed(id), t::CARD_W as u32, false);
     xilem::view::sized_box(flex_col((
         hot(
             xilem::view::sized_box(image(art).fit(ObjectFit::Fill))
@@ -665,7 +863,8 @@ fn album_card(z: &mut Zuno, id: AlbumId) -> AnyV {
 fn mix_card(z: &mut Zuno, id: PlaylistId) -> AnyV {
     let p = z.app.library.playlist(id).unwrap();
     let title = p.title.clone();
-    let art = z.art(AppState::playlist_seed(id), t::CARD_W as u32, false);
+    let art_url = p.artwork_url.clone();
+    let art = z.cover(art_url.as_deref(), AppState::playlist_seed(id), t::CARD_W as u32, false);
     xilem::view::sized_box(flex_col((
         hot(
             xilem::view::sized_box(image(art).fit(ObjectFit::Fill))
@@ -689,7 +888,8 @@ fn mix_card(z: &mut Zuno, id: PlaylistId) -> AnyV {
 
 fn artist_card(z: &mut Zuno, id: ArtistId) -> AnyV {
     let name = z.app.library.artist(id).name.clone();
-    let art = z.art(AppState::artist_seed(id), t::CARD_W as u32, true);
+    let art_url = z.app.library.artist(id).artwork_url.clone();
+    let art = z.cover(art_url.as_deref(), AppState::artist_seed(id), t::CARD_W as u32, true);
     xilem::view::sized_box(flex_col((
         hot(
             xilem::view::sized_box(image(art).fit(ObjectFit::Fill))
@@ -818,7 +1018,8 @@ fn track_row(z: &mut Zuno, index: usize, id: TrackId, on_play: impl Fn(&mut Zuno
     let playing = z.app.current == Some(id);
     let selected = z.app.selection == Some(index);
     let album_seed = AppState::album_seed(z.app.library.track(id).album_id);
-    let art = z.art(album_seed, t::ROW_ART as u32, false);
+    let art_url = z.app.library.track(id).artwork_url.clone();
+    let art = z.cover(art_url.as_deref(), album_seed, t::ROW_ART as u32, false);
 
     let bg = if playing {
         row_playing()
@@ -921,7 +1122,8 @@ fn artist_row(z: &mut Zuno, id: ArtistId) -> AnyV {
     let r = z.app.library.artist(id);
     let name = r.name.clone();
     let n_albums = r.album_ids.len();
-    let art = z.art(AppState::artist_seed(id), t::ROW_ART as u32, true);
+    let art_url = r.artwork_url.clone();
+    let art = z.cover(art_url.as_deref(), AppState::artist_seed(id), t::ROW_ART as u32, true);
     hot(
         flex_row((
             xilem::view::sized_box(image(art).fit(ObjectFit::Fill))
@@ -959,7 +1161,8 @@ fn album_page(z: &mut Zuno, id: AlbumId) -> AnyV {
     let kind = a.kind.label();
     let meta = counts_line(a.track_ids.iter().map(|&tid| z.app.library.track(tid).duration_sec));
     let ids: Vec<TrackId> = a.track_ids.clone();
-    let art = z.art(AppState::album_seed(id), 232, false);
+    let art_url = a.artwork_url.clone();
+    let art = z.cover(art_url.as_deref(), AppState::album_seed(id), 232, false);
 
     flex_col((
         media_header(z, art, title, format!("{kind} · {artist} · {year}"), meta).into_any_flex(),
@@ -977,7 +1180,8 @@ fn playlist_page(z: &mut Zuno, id: PlaylistId) -> AnyV {
     let desc = p.description.clone().unwrap_or_default();
     let ids: Vec<TrackId> = p.track_ids.clone();
     let meta = counts_line(ids.iter().map(|&tid| z.app.library.track(tid).duration_sec));
-    let art = z.art(AppState::playlist_seed(id), 232, false);
+    let art_url = p.artwork_url.clone();
+    let art = z.cover(art_url.as_deref(), AppState::playlist_seed(id), 232, false);
 
     flex_col((
         media_header(z, art, title, desc, meta).into_any_flex(),
@@ -1000,7 +1204,8 @@ fn artist_page(z: &mut Zuno, id: ArtistId) -> AnyV {
         .take(10)
         .collect();
     let album_ids: Vec<AlbumId> = r.album_ids.clone();
-    let art = z.art(AppState::artist_seed(id), 232, true);
+    let art_url = r.artwork_url.clone();
+    let art = z.cover(art_url.as_deref(), AppState::artist_seed(id), 232, true);
 
     flex_col((
         media_header(z, art, name.clone(), listeners_line, format!("About {name}"))
@@ -1124,7 +1329,8 @@ fn search_page(z: &mut Zuno) -> AnyV {
         let tv = z.app.library.track_view(id);
         let title: ArcStr = tv.title.into();
         let artist: ArcStr = tv.artist.into();
-        let art = z.art(AppState::album_seed(z.app.library.track(id).album_id), 120, false);
+        let art_url = z.app.library.track(id).artwork_url.clone();
+        let art = z.cover(art_url.as_deref(), AppState::album_seed(z.app.library.track(id).album_id), 120, false);
         xilem::view::sized_box(flex_col((
             h2("Top result").into_any_flex(),
             xilem::view::sized_box(image(art).fit(ObjectFit::Fill))
@@ -1182,6 +1388,28 @@ fn settings_page(z: &mut Zuno) -> AnyV {
         })
         .into_any_flex(),
         small("Zuno native benchmark — rendered, not wired.").into_any_flex(),
+        h3("YouTube Music").into_any_flex(),
+        text_input(z.cookie.clone(), |z: &mut Zuno, q: String| {
+            z.cookie = q;
+        })
+        .placeholder("Paste your music.youtube.com Cookie: header…")
+        .text_color(FG)
+        .prop(masonry::properties::PlaceholderColor::new(MUTED_FG))
+        .into_any_flex(),
+        hot(
+            body_med("Sign in with cookie").color(FG),
+            move |z: &mut Zuno| {
+                if let Some(tx) = &z.yt_tx {
+                    let header = z.cookie.trim().to_string();
+                    if !header.is_empty() {
+                        let _ = tx.send(YtReq::SignIn { header });
+                        z.yt_status = "Signing in…".to_string();
+                    }
+                }
+            },
+        )
+        .into_any_flex(),
+        small(if z.yt_status.is_empty() { "Unsigned — public content only.".to_string() } else { z.yt_status.clone() }).into_any_flex(),
     ))
     .gap(px(10.0))
     .cross_axis_alignment(CrossAxisAlignment::Fill)
@@ -1252,7 +1480,8 @@ fn queue_row(z: &mut Zuno, id: TrackId, region: Region, flat_index: usize) -> An
     let playing = z.app.current == Some(id);
     let is_current = region == Region::Current;
     let album_seed = AppState::album_seed(z.app.library.track(id).album_id);
-    let art = z.art(album_seed, t::ROW_ART as u32, false);
+    let art_url = z.app.library.track(id).artwork_url.clone();
+    let art = z.cover(art_url.as_deref(), album_seed, t::ROW_ART as u32, false);
     let idx = flat_index;
     let row = flex_row((
         xilem::view::sized_box(image(art).fit(ObjectFit::Fill))
@@ -1316,7 +1545,7 @@ fn player_bar(z: &mut Zuno) -> impl WidgetView<Zuno> + use<> {
 
     let (art, title, artist, album_id, track_id, liked) = match &current {
         Some(track) => (
-            Some(z.art(AppState::album_seed(track.album_id), t::ROW_ART as u32, false)),
+            Some(z.cover(track.artwork_url.clone().as_deref(), AppState::album_seed(track.album_id), t::ROW_ART as u32, false)),
             Some(track.title.clone()),
             Some(z.app.library.artist(track.artist_id).name.clone()),
             Some(track.album_id),

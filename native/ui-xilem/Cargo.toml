@@ -11,6 +11,12 @@ path = "src/main.rs"
 
 [dependencies]
 zuno-core = { path = "../core" }
+zuno-yt = { path = "../yt" }
+# The yt worker thread's Innertube runtime (xilem/masonry has no async).
+tokio = { version = "1", default-features = false, features = ["rt"] }
+# Send+Sync receiver: xilem's views inherit the state's auto traits, so
+# std::sync::mpsc's !Sync Receiver poisons every view signature.
+crossbeam-channel = "0.5"
 xilem = "0.4"
 masonry = "0.4"
 tracing = "0.1"
